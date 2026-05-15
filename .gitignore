@@ -95,3 +95,7 @@ NETLIST_CLEANING_SUMMARY.md
 # Claude
 CLAUDE.md
 .claude/
+
+# Generated LP/ILP files (from placement experiments)
+*.lp
+*.lp.*
