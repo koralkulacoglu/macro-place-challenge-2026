@@ -26,8 +26,12 @@ def _um_to_nm(v: float) -> int:
     return int(round(v * SCALE))
 
 
-def write_bookshelf(benchmark: Benchmark, outdir: str) -> str:
-    """Write Bookshelf files and return the .aux path."""
+def write_bookshelf(benchmark: Benchmark, outdir: str, fix_soft: bool = False) -> str:
+    """Write Bookshelf files and return the .aux path.
+
+    fix_soft=True: soft macros written as 'terminal' (FIXED), so DREAMPlace only
+    optimizes hard macros while soft macros stay at their CT positions.
+    """
     os.makedirs(outdir, exist_ok=True)
     name = benchmark.name
 
@@ -37,18 +41,20 @@ def write_bookshelf(benchmark: Benchmark, outdir: str) -> str:
                     if benchmark.macro_fixed[i]]
     movable_soft = list(range(benchmark.num_hard_macros, benchmark.num_macros))
 
-    # Hard macros first, then soft macros, then fixed hard — all as movable nodes.
-    # Soft macros are placed FIRST in the movable ordering so DREAMPlace's
-    # macro_legalize C++ call (which processes 0..num_movable_hard-1) only
-    # legalizes hard macros when we monkey-patch num_movable_nodes.
-    # Node DREAMPlace ordering: movable_hard | movable_soft | fixed_hard
-    ordered = movable_hard + movable_soft + fixed_hard
+    # With fix_soft: movable_hard only; soft macros and fixed_hard are all terminals.
+    # Without fix_soft: movable_hard | movable_soft | fixed_hard (standard ordering).
+    if fix_soft:
+        ordered   = movable_hard + movable_soft + fixed_hard
+        fixed_ids = set(movable_soft) | set(fixed_hard)  # all non-hard are terminals
+    else:
+        ordered   = movable_hard + movable_soft + fixed_hard
+        fixed_ids = set(fixed_hard)
 
     port_pos  = benchmark.port_positions
     num_ports = port_pos.shape[0]
 
-    _write_nodes(benchmark, outdir, name, ordered, fixed_hard, num_ports)
-    _write_pl(benchmark, outdir, name, ordered, fixed_hard, num_ports, port_pos)
+    _write_nodes(benchmark, outdir, name, ordered, fixed_ids, num_ports)
+    _write_pl(benchmark, outdir, name, ordered, fixed_ids, num_ports, port_pos)
     _write_nets(benchmark, outdir, name, ordered, num_ports)
     _write_scl(benchmark, outdir, name)
     _write_aux(outdir, name)
@@ -60,19 +66,21 @@ def _mn(idx):
     return f"n{idx}"
 
 
-def _write_nodes(benchmark, outdir, name, ordered, fixed_hard, num_ports):
+def _write_nodes(benchmark, outdir, name, ordered, fixed_ids, num_ports):
+    # fixed_ids: set of node indices to mark as terminal (FIXED)
     macro_sizes = benchmark.macro_sizes.numpy()
-    num_movable = len(ordered) - len(fixed_hard)
+    fixed_set = set(fixed_ids) if not isinstance(fixed_ids, set) else fixed_ids
+    num_fixed = len(fixed_set)
     lines = [
         "UCLA nodes 1.0",
         f"NumNodes : {len(ordered) + num_ports}",
-        f"NumTerminals : {len(fixed_hard) + num_ports}",
+        f"NumTerminals : {num_fixed + num_ports}",
         "",
     ]
-    for i, idx in enumerate(ordered):
+    for idx in ordered:
         w = _um_to_nm(macro_sizes[idx, 0])
         h = _um_to_nm(macro_sizes[idx, 1])
-        suffix = "\tterminal" if i >= num_movable else ""
+        suffix = "\tterminal" if idx in fixed_set else ""
         lines.append(f"\t{_mn(idx)}\t{w}\t{h}{suffix}")
     for pi in range(num_ports):
         lines.append(f"\tport{pi}\t1\t1\tterminal_NI")
@@ -80,10 +88,10 @@ def _write_nodes(benchmark, outdir, name, ordered, fixed_hard, num_ports):
         f.write("\n".join(lines) + "\n")
 
 
-def _write_pl(benchmark, outdir, name, ordered, fixed_hard, num_ports, port_pos):
+def _write_pl(benchmark, outdir, name, ordered, fixed_ids, num_ports, port_pos):
     macro_pos  = benchmark.macro_positions.numpy()
     macro_size = benchmark.macro_sizes.numpy()
-    fixed_set  = set(fixed_hard)
+    fixed_set  = set(fixed_ids) if not isinstance(fixed_ids, set) else fixed_ids
     lines = ["UCLA pl 1.0", ""]
     for idx in ordered:
         cx, cy = macro_pos[idx]
