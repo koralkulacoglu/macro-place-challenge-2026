@@ -108,20 +108,10 @@ class KoralPlacer:
 
         plc = _load_plc(benchmark)
 
-        if _dreamplace_available():
-            placement = self._run_dreamplace(benchmark)
-        else:
-            print("[warn] DREAMPlace not available — using initial positions")
-            placement = benchmark.macro_positions.clone()
-
-        # Legalize hard macros; fall back to benchmark initial positions if DREAMPlace
-        # left unsolvable overlaps (happens for large dense benchmarks like ibm12)
+        # Use CT initial positions — already near-optimal from Circuit Training.
+        # Legalization is cheap: overlaps are large-X/tiny-Y pairs, resolved by ~5nm Y push.
+        placement = benchmark.macro_positions.clone()
         placement = self._legalize_hard(placement, benchmark)
-        remaining = self._count_hard_overlaps_f32(placement, benchmark)
-        if remaining > 0:
-            print(f"  [fallback] DREAMPlace left {remaining} overlaps after legalization, using initial positions")
-            placement = benchmark.macro_positions.clone()
-            placement = self._legalize_hard(placement, benchmark)
 
         if plc is not None and self.sa_time_budget > 0:
             placement = self._sa_polish(placement, benchmark, plc)
@@ -164,7 +154,7 @@ class KoralPlacer:
         except Exception as e:
             print(f"  [patch] macro_legalize patch failed: {e} — legalization may be slow")
 
-    def _run_dreamplace(self, benchmark: Benchmark) -> torch.Tensor:
+    def _run_dreamplace(self, benchmark: Benchmark, center_init: bool = True) -> torch.Tensor:
         import Params
         import PlaceDB
         import NonLinearPlace
@@ -207,7 +197,7 @@ class KoralPlacer:
                 "enable_fillers":     1,
                 "stop_overflow":      0.07,
                 "gp_noise_ratio":     0.025,
-                "random_center_init_flag": 1,
+                "random_center_init_flag": 1 if center_init else 0,
                 "ignore_net_degree":  100,
                 "num_threads":        8,
                 "random_seed":        self.seed,
@@ -310,7 +300,7 @@ class KoralPlacer:
         sep_y = sep_y_exact + GAP
 
         pass_idx = 0
-        for pass_idx in range(500):
+        for pass_idx in range(2000):
             # Vectorized overlap detection (any positive physical overlap)
             dx_mat = np.abs(pos[:, 0:1] - pos[np.newaxis, :, 0])
             dy_mat = np.abs(pos[:, 1:2] - pos[np.newaxis, :, 1])
@@ -370,6 +360,46 @@ class KoralPlacer:
             if not changed:
                 break
 
+        # Diagonal push stage for any remaining stuck pairs:
+        # push in BOTH x and y to break cycles that the min-direction approach can't escape
+        for diag_pass in range(200):
+            dx_mat = np.abs(pos[:, 0:1] - pos[np.newaxis, :, 0])
+            dy_mat = np.abs(pos[:, 1:2] - pos[np.newaxis, :, 1])
+            is_ov = (sep_x_exact - dx_mat > 0) & (sep_y_exact - dy_mat > 0)
+            np.fill_diagonal(is_ov, False)
+            if not is_ov.any():
+                break
+            changed = False
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if not is_ov[i, j] or (not movable[i] and not movable[j]):
+                        continue
+                    dx = abs(pos[i, 0] - pos[j, 0])
+                    dy = abs(pos[i, 1] - pos[j, 1])
+                    ox = sep_x[i, j] - dx
+                    oy = sep_y[i, j] - dy
+                    if ox <= 0 and oy <= 0:
+                        continue
+                    both = movable[i] and movable[j]
+                    sx = 1.0 if pos[i, 0] >= pos[j, 0] else -1.0
+                    sy = 1.0 if pos[i, 1] >= pos[j, 1] else -1.0
+                    fx = max(ox, 0) * sx; fy = max(oy, 0) * sy
+                    s = 0.5 if both else 1.0
+                    if movable[i]:
+                        xi_new = np.clip(pos[i, 0] + fx * s, half_w[i], cw - half_w[i])
+                        yi_new = np.clip(pos[i, 1] + fy * s, half_h[i], ch - half_h[i])
+                        if abs(xi_new-pos[i,0]) > 1e-9 or abs(yi_new-pos[i,1]) > 1e-9:
+                            changed = True
+                        pos[i, 0] = xi_new; pos[i, 1] = yi_new
+                    if movable[j]:
+                        xj_new = np.clip(pos[j, 0] - fx * s, half_w[j], cw - half_w[j])
+                        yj_new = np.clip(pos[j, 1] - fy * s, half_h[j], ch - half_h[j])
+                        if abs(xj_new-pos[j,0]) > 1e-9 or abs(yj_new-pos[j,1]) > 1e-9:
+                            changed = True
+                        pos[j, 0] = xj_new; pos[j, 1] = yj_new
+            if not changed:
+                break
+
         # Report remaining overlaps for debugging
         dx_mat = np.abs(pos[:, 0:1] - pos[np.newaxis, :, 0])
         dy_mat = np.abs(pos[:, 1:2] - pos[np.newaxis, :, 1])
@@ -377,7 +407,7 @@ class KoralPlacer:
         np.fill_diagonal(ov, False)
         n_ov = int(ov.sum()) // 2
         if n_ov > 0:
-            print(f"  [legalize] {pass_idx+1} passes, {n_ov} hard macro overlaps remain")
+            print(f"  [legalize] {pass_idx+1}+diag passes, {n_ov} hard macro overlaps remain")
         result = placement.clone()
         result[:n] = torch.tensor(pos, dtype=torch.float32)
         return result
@@ -534,10 +564,8 @@ class KoralPlacer:
 
         pos = placement.numpy().copy()
 
-        # Soft macro centroid update before SA: move soft macros toward hard macros/ports
-        pos = self._update_soft_macros(pos, benchmark)
-
-        # Initial proxy cost (soft macros already updated above)
+        # Keep soft macros at CT initial positions — they are already optimized by Circuit Training.
+        # Replacing them with crude centroids degrades proxy cost catastrophically (e.g. ibm09: 1.11→4.15).
         init_cost = compute_proxy_cost(
             torch.tensor(pos, dtype=torch.float32), benchmark, plc
         )["proxy_cost"]
@@ -584,9 +612,6 @@ class KoralPlacer:
                     continue
                 old_i, old_j = old, None  # track for revert on reject
 
-            # Update soft macros to track new hard macro positions before evaluating cost
-            self._update_soft_macros(pos, benchmark)
-
             new_cost = compute_proxy_cost(
                 torch.tensor(pos, dtype=torch.float32), benchmark, plc
             )["proxy_cost"]
@@ -597,11 +622,10 @@ class KoralPlacer:
             if delta < 0 or random.random() < math.exp(-delta / max(T_acc, 1e-10)):
                 cur_cost = new_cost  # accept
             else:
-                # Reject: revert hard macro(s) and soft macros
+                # Reject: revert hard macro(s) only (soft macros stay at CT positions)
                 pos[i] = old_i
                 if old_j is not None:
                     pos[j] = old_j
-                self._update_soft_macros(pos, benchmark)
 
             step += 1
 
