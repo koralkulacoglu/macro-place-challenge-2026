@@ -36,7 +36,13 @@ def write_bookshelf(benchmark: Benchmark, outdir: str) -> str:
     fixed_hard   = [i for i in range(benchmark.num_hard_macros)
                     if benchmark.macro_fixed[i]]
     movable_soft = list(range(benchmark.num_hard_macros, benchmark.num_macros))
-    ordered      = movable_hard + movable_soft + fixed_hard
+
+    # Hard macros first, then soft macros, then fixed hard — all as movable nodes.
+    # Soft macros are placed FIRST in the movable ordering so DREAMPlace's
+    # macro_legalize C++ call (which processes 0..num_movable_hard-1) only
+    # legalizes hard macros when we monkey-patch num_movable_nodes.
+    # Node DREAMPlace ordering: movable_hard | movable_soft | fixed_hard
+    ordered = movable_hard + movable_soft + fixed_hard
 
     port_pos  = benchmark.port_positions
     num_ports = port_pos.shape[0]
