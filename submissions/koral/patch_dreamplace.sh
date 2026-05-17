@@ -1,49 +1,95 @@
 #!/bin/bash
 # Apply compatibility patches to a cloned DREAMPlace source tree.
 # Usage: bash patch_dreamplace.sh /path/to/dreamplace_src
-set -euo pipefail
+set -eu
 SRC="${1:?Usage: $0 <dreamplace_src_dir>}"
 
-# Patch 1: CUDA detection without a live GPU
+# Patch 1: CUDA detection without a live GPU device
 sed -i \
   "s/print(int(torch.cuda.is_available()))/print(int(torch.version.cuda is not None))/" \
   "$SRC/cmake/TorchExtension.cmake"
 
-# Patch 2: Disable CUDA ops incompatible with CUDA 12.4 CUB headers
-sed -i 's/^if(TORCH_ENABLE_CUDA)/if(FALSE) # disabled/' \
-  "$SRC/dreamplace/ops/pin_pos/CMakeLists.txt"
-sed -i 's/^if (TORCH_ENABLE_CUDA)/if(FALSE) # disabled/' \
-  "$SRC/dreamplace/ops/k_reorder/CMakeLists.txt"
-sed -i 's/^if(TORCH_ENABLE_CUDA)/if(FALSE) # disabled/' \
-  "$SRC/dreamplace/ops/global_swap/CMakeLists.txt"
-sed -i 's/^if(TORCH_ENABLE_CUDA)/if(FALSE) # disabled/' \
-  "$SRC/dreamplace/ops/independent_set_matching/CMakeLists.txt"
+# Patch 2: Disable ONLY pin_pos_cuda_segment (CUB segmented-reduce, CUDA 12.4 incompatible).
+# Keep pin_pos_cuda enabled — it's needed for global placement and compiles fine without CUB.
+# Also disable k_reorder_cuda, global_swap_cuda, independent_set_matching_cuda (all CUB-based).
+python3 -c "
+import re, sys
 
-# Patch 3: NumPy 2.0 removed np.string_
-sed -i 's/np\.string_/np.bytes_/g' "$SRC/dreamplace/PlaceDB.py"
+def disable_target(cmake_path, target_name):
+    '''Disable cmake target by name without touching other targets in the same file.'''
+    content = open(cmake_path).read()
+    # Find if(TORCH_ENABLE_CUDA) blocks containing the target name and replace with if(FALSE)
+    # Split on 'if(TORCH_ENABLE_CUDA)' and check each block
+    blocks = re.split(r'(?=if\s*\((?:TORCH_ENABLE_CUDA|torch_enable_cuda)\))', content)
+    result = []
+    for block in blocks:
+        if re.match(r'if\s*\((?:TORCH_ENABLE_CUDA|torch_enable_cuda)\)', block):
+            if target_name in block:
+                # Disable this block
+                block = re.sub(r'^if\s*\((?:TORCH_ENABLE_CUDA|torch_enable_cuda)\)',
+                               'if(FALSE) # koral: disabled (CUDA 12.4 CUB incompatible)', block, count=1)
+                print(f'  Disabled {target_name} in {cmake_path}')
+        result.append(block)
+    open(cmake_path, 'w').write(''.join(result))
 
-# Patch 4: Soft-import disabled CUDA modules (try/except) via inline Python
-DREAMPLACE_SRC="$SRC" python3 -c "
-import re, os
+src = sys.argv[1]
+# pin_pos: disable ONLY pin_pos_cuda_segment (CUB-based), keep pin_pos_cuda
+disable_target(src + '/dreamplace/ops/pin_pos/CMakeLists.txt', 'pin_pos_cuda_segment')
+# These three are all CUB-based detailed-placement ops; disable completely
+disable_target(src + '/dreamplace/ops/k_reorder/CMakeLists.txt', 'k_reorder')
+disable_target(src + '/dreamplace/ops/global_swap/CMakeLists.txt', 'global_swap')
+disable_target(src + '/dreamplace/ops/independent_set_matching/CMakeLists.txt', 'independent_set_matching')
+" "$SRC"
 
-src = os.environ['DREAMPLACE_SRC']
-ops = {
-    'pin_pos': 'pin_pos_cuda_segment',
-    'global_swap': 'global_swap_cuda',
-    'k_reorder': 'k_reorder_cuda',
-    'independent_set_matching': 'independent_set_matching_cuda',
-}
+# Patch 3: NumPy 2.0 compatibility — np.string_ removed, replaced by np.bytes_
+# Fix ALL Python files in DREAMPlace (not just PlaceDB.py)
+find "$SRC/dreamplace" -name "*.py" -exec sed -i 's/np\.string_/np.bytes_/g' {} \;
+echo "  Fixed np.string_ in all DREAMPlace Python files"
+
+# Patch 4: Soft-import disabled CUDA modules with proper fallbacks.
+# Handles all import patterns (absolute, relative, from-import).
+# Sets module to None on ImportError so callers can do 'if mod is not None: use CUDA'.
+python3 -c "
+import re, os, sys
+
+src = sys.argv[1]
+
+# Ops that were disabled at build time → need Python-level None fallback
+disabled_mods = [
+    'pin_pos_cuda_segment',  # disabled in pin_pos
+    'k_reorder_cuda',
+    'global_swap_cuda',
+    'independent_set_matching_cuda',
+]
+
 base = os.path.join(src, 'dreamplace', 'ops')
-for op, mod in ops.items():
-    path = os.path.join(base, op, op + '.py')
-    if not os.path.exists(path):
+for op_dir in os.listdir(base):
+    op_path = os.path.join(base, op_dir, op_dir + '.py')
+    if not os.path.exists(op_path):
         continue
-    content = open(path).read()
-    pattern = r'([ \t]*)(import dreamplace\.ops\.[^\n]*' + re.escape(mod) + r'[^\n]*\n)'
-    repl = r'\1try:\n\1    \2\1except ImportError:\n\1    ' + mod + ' = None\n'
-    content = re.sub(pattern, repl, content)
-    open(path, 'w').write(content)
-    print('Patched', path)
-"
+    content = open(op_path).read()
+    modified = False
+    for mod in disabled_mods:
+        if mod not in content:
+            continue
+        # Pattern 1: absolute import
+        p1 = r'([ \t]*)(import\s+dreamplace\.ops\.[^\n]*\b' + re.escape(mod) + r'\b[^\n]*\n)'
+        r1 = r'\1try:\n\1    \2\1except (ImportError, Exception):\n\1    ' + mod + ' = None\n'
+        new = re.sub(p1, r1, content)
+        # Pattern 2: relative from-import
+        p2 = r'([ \t]*)(from\s+\.\s+import\s+' + re.escape(mod) + r'\b[^\n]*\n)'
+        r2 = r'\1try:\n\1    \2\1except (ImportError, Exception):\n\1    ' + mod + ' = None\n'
+        new = re.sub(p2, r2, new)
+        # Pattern 3: from-dotmod import
+        p3 = r'([ \t]*)(from\s+\.' + re.escape(mod) + r'\s+import\s+[^\n]*\n)'
+        r3 = r'\1try:\n\1    \2\1except (ImportError, Exception):\n\1    pass\n'
+        new = re.sub(p3, r3, new)
+        if new != content:
+            content = new
+            modified = True
+            print(f'  Patched import of {mod} in {op_path}')
+    if modified:
+        open(op_path, 'w').write(content)
+" "$SRC"
 
 echo "All patches applied successfully."

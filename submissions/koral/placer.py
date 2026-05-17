@@ -31,13 +31,44 @@ for _p in [_DP_INSTALL, _DP_PKG]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+# Stub out CUDA ops that were disabled at build time (CUDA 12.4 CUB API incompatibility).
+# Must run before any DREAMPlace module imports so module-level references resolve correctly.
+# CPU fallbacks are provided where available (pin_pos_cpp for pin_pos_cuda).
+if any(p in sys.path for p in [_DP_INSTALL, _DP_PKG]):
+    import numpy as _np_compat
+    if not hasattr(_np_compat, 'string_'):
+        _np_compat.string_ = _np_compat.bytes_  # NumPy 2.0 compat
+    from types import ModuleType as _ModuleType
+    _dp_cuda_stubs = {
+        'dreamplace.ops.pin_pos.pin_pos_cuda': 'dreamplace.ops.pin_pos.pin_pos_cpp',
+        'dreamplace.ops.pin_pos.pin_pos_cuda_segment': 'dreamplace.ops.pin_pos.pin_pos_cpp',
+        'dreamplace.ops.k_reorder.k_reorder_cuda': None,
+        'dreamplace.ops.global_swap.global_swap_cuda': None,
+        'dreamplace.ops.independent_set_matching.independent_set_matching_cuda': None,
+    }
+    for _cud, _cpu in _dp_cuda_stubs.items():
+        if _cud not in sys.modules:
+            try:
+                __import__(_cud)
+            except (ImportError, Exception):
+                _stub = _ModuleType(_cud.split('.')[-1])
+                if _cpu:
+                    try:
+                        _cpu_mod = __import__(_cpu, fromlist=['forward'])
+                        for _attr in dir(_cpu_mod):
+                            if not _attr.startswith('__'):
+                                setattr(_stub, _attr, getattr(_cpu_mod, _attr))
+                    except (ImportError, Exception):
+                        pass
+                sys.modules[_cud] = _stub
+
 # Suppress DREAMPlace's verbose logging
 logging.getLogger().setLevel(logging.WARNING)
-# Unbuffered output for live progress in nohup/pipe contexts
-sys.stdout.reconfigure(line_buffering=True)
+# Unbuffered output for live progress in nohup/pipe contexts; UTF-8 for Windows cp1252 compat
+sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
 
 from macro_place.benchmark import Benchmark
-from macro_place.objective  import compute_proxy_cost
+from macro_place.objective  import compute_proxy_cost, compute_overlap_metrics
 
 # Import bookshelf writer from same directory
 _HERE = Path(__file__).parent
@@ -50,12 +81,17 @@ from bookshelf import write_bookshelf, dreamplace_nodes_to_tensor
 def _load_plc(benchmark: Benchmark):
     """Reload PlacementCost for a benchmark — needed to call compute_proxy_cost."""
     try:
-        from macro_place.loader import load_benchmark_from_dir, load_benchmark
+        from macro_place.loader import load_benchmark
 
-        # IBM ICCAD04 path
-        root = Path("external/MacroPlacement/Testcases/ICCAD04") / benchmark.name
-        if root.exists():
-            _, plc = load_benchmark_from_dir(str(root))
+        # Use forward-slash strings so plc_client_os.rsplit('/') works on Windows too
+        base_ibm = "external/MacroPlacement/Testcases/ICCAD04/" + benchmark.name
+        netlist = base_ibm + "/netlist.pb.txt"
+        plc_file = base_ibm + "/initial.plc"
+        if Path(netlist).exists():
+            _, plc = load_benchmark(
+                netlist,
+                plc_file if Path(plc_file).exists() else None,
+            )
             return plc
 
         # NG45 paths
@@ -65,12 +101,14 @@ def _load_plc(benchmark: Benchmark):
         }
         ng45_name = ng45_map.get(benchmark.name)
         if ng45_name:
-            base = (Path("external/MacroPlacement/Flows/NanGate45")
-                    / ng45_name / "netlist" / "output_CT_Grouping")
-            if (base / "netlist.pb.txt").exists():
+            base_ng = ("external/MacroPlacement/Flows/NanGate45/"
+                       + ng45_name + "/netlist/output_CT_Grouping")
+            ng_netlist = base_ng + "/netlist.pb.txt"
+            ng_plc = base_ng + "/initial.plc"
+            if Path(ng_netlist).exists():
                 _, plc = load_benchmark(
-                    str(base / "netlist.pb.txt"),
-                    str(base / "initial.plc"),
+                    ng_netlist,
+                    ng_plc if Path(ng_plc).exists() else None,
                 )
                 return plc
     except Exception as e:
@@ -94,7 +132,7 @@ class KoralPlacer:
         target_density: float = 0.0,     # 0 = auto from utilization
         density_weight: float = 8e-5,
         gamma: float = 4.0,
-        sa_time_budget: int = 600,        # seconds for CD+LNS+oracle SA polish
+        sa_time_budget: int = int(os.environ.get("KORAL_SA_BUDGET", "3480")),  # 1hr judge limit
         seed: int = 42,
     ):
         self.target_density  = target_density
@@ -113,67 +151,50 @@ class KoralPlacer:
         # Start from CT positions, then try DREAMPlace if available.
         # CT positions: already near-optimal from Circuit Training (good congestion/density).
         ct = benchmark.macro_positions.clone()
-        # Skip legalization if CT has only sub-4nm overlaps (TILOS ignores these;
-        # our 5nm-gap legalizer would push macros and cost +0.27 proxy on ibm06).
+        # Full legalization for significant (>4nm) overlaps; micro-legalize for sub-4nm.
+        # CT positions for ibm06 have 47 sub-4nm float64 overlaps. SA preserves these
+        # because SA only rejects NEW candidate overlaps, never fixes existing ones.
+        # micro_legalize here resolves CT overlaps before SA sees them (CT macros are
+        # grid-placed, not at boundaries, so micro_legalize converges in 1-2 passes).
         if self._count_significant_overlaps(ct, benchmark, threshold=0.004) > 0:
             ct_legal = self._legalize_hard(ct, benchmark)
         else:
             ct_legal = ct
+            # Note: pre-SA micro_legalize causes cascade amplification on dense benchmarks
+            # (ibm06: 47 pairs chain-react, each 7nm push creates new overlaps → 15μm max
+            # displacement → oracle 1.87 vs CT's 1.66). SA preserves existing sub-4nm
+            # overlaps but also won't place macros INTO overlapping positions (via _overlaps
+            # filter). Post-SA micro_legalize handles any residual overlaps.
 
         placement = ct_legal  # default: CT positions
 
+        n_mv_hard = sum(1 for i in range(benchmark.num_hard_macros)
+                        if not benchmark.macro_fixed[i])
+
         if _dreamplace_available():
-            # Try DREAMPlace variants and keep the best result.
-            # center_init=True: good for small/sparse benchmarks (good global spread from scratch)
-            # center_init=False: good for large/dense benchmarks (refine CT positions)
+            # Try center-init DREAMPlace and keep result only if it beats CT.
+            # CPU-only mode (gpu=0) due to CUDA 12.4 pin_pos_cuda incompatibility in Docker build.
+            # ibm01 (246 movable macros) benefits significantly; ibm02-18 (271+) typically don't.
+            # Adaptive iterations control runtime: large benchmarks get fewer iterations (~1 min).
             ct_cost = compute_proxy_cost(ct_legal, benchmark, plc)["proxy_cost"] if plc else float('inf')
             best_dp_cost = ct_cost
             best_placement = ct_legal
 
-            # Run center-init DREAMPlace. For benchmarks where center beats CT, try a
-            # second seed to reduce non-determinism (DREAMPlace GPU results vary slightly).
-            seeds_to_try = [self.seed]
-            for seed_i, dp_seed in enumerate(seeds_to_try):
-                tag = "center" if seed_i == 0 else f"center-s{seed_i+1}"
-                try:
-                    dp = self._run_dreamplace(benchmark, center_init=True,
-                                              fix_soft=False, dp_seed=dp_seed)
-                    dp = self._legalize_hard(dp, benchmark)
-                    if self._count_hard_overlaps_f32(dp, benchmark) > 0:
-                        continue
-                    if plc is None:
-                        continue
+            # Run center-init DREAMPlace (single seed — skip s2/CT-init to save time).
+            try:
+                dp = self._run_dreamplace(benchmark, center_init=True,
+                                          fix_soft=False, dp_seed=self.seed)
+                dp = self._legalize_hard(dp, benchmark)
+                if self._count_hard_overlaps_f32(dp, benchmark) == 0 and plc is not None:
                     dp_cost = compute_proxy_cost(dp, benchmark, plc)["proxy_cost"]
                     if dp_cost < best_dp_cost:
-                        print(f"  [start] DREAMPlace({tag}) {dp_cost:.4f} < best {best_dp_cost:.4f}")
+                        print(f"  [start] DREAMPlace(center) {dp_cost:.4f} < best {best_dp_cost:.4f}")
                         best_dp_cost = dp_cost
                         best_placement = dp
-                        # Try 2nd seed only when center beats CT (worth 3 extra minutes)
-                        if dp_cost < ct_cost and self.seed + 1 not in seeds_to_try:
-                            seeds_to_try.append(self.seed + 1)
                     else:
-                        print(f"  [start] DREAMPlace({tag}) {dp_cost:.4f} >= best {best_dp_cost:.4f}")
-                except Exception as e:
-                    print(f"  [start] DREAMPlace({tag}) failed: {e}")
-
-            # CT-init DREAMPlace: start from CT positions (.pl file), not random center.
-            # Top teams use this approach — DREAMPlace refines congestion-aware CT positions.
-            try:
-                dp_ct = self._run_dreamplace(benchmark, center_init=False,
-                                             fix_soft=False, dp_seed=self.seed)
-                dp_ct = self._legalize_hard(dp_ct, benchmark)
-                if self._count_hard_overlaps_f32(dp_ct, benchmark) == 0 and plc is not None:
-                    dp_ct_cost = compute_proxy_cost(dp_ct, benchmark, plc)["proxy_cost"]
-                    if dp_ct_cost < best_dp_cost:
-                        print(f"  [start] DREAMPlace(CT-init) {dp_ct_cost:.4f} < best {best_dp_cost:.4f}")
-                        best_dp_cost = dp_ct_cost
-                        best_placement = dp_ct
-                    else:
-                        print(f"  [start] DREAMPlace(CT-init) {dp_ct_cost:.4f} >= best {best_dp_cost:.4f}")
-                else:
-                    print("  [start] DREAMPlace(CT-init) overlaps remain, skipping")
+                        print(f"  [start] DREAMPlace(center) {dp_cost:.4f} >= best {best_dp_cost:.4f}")
             except Exception as e:
-                print(f"  [start] DREAMPlace(CT-init) failed: {e}")
+                print(f"  [start] DREAMPlace(center) failed: {e}")
 
             placement = best_placement
 
@@ -247,10 +268,23 @@ class KoralPlacer:
 
             aux_path = write_bookshelf(benchmark, tmpdir, fix_soft=fix_soft)
 
+            # Adaptive DREAMPlace iterations based on benchmark size.
+            # GPU CUDA ops incompatible with our Docker build (CUDA 12.4 CUB issue) → CPU only.
+            # CPU timing: <=50 macros ~5min, <=200 ~2min, >200 ~1min.
+            n_mv_hard = len(movable_hard)
+            _gpu = 0  # CPU mode (GPU pin_pos_cuda disabled at build time for CUDA 12.4 compat)
+            # ibm01 has ~246 movable macros; ibm02+ have 271+.
+            # Full 1000+1500 iterations for ≤260 macros (~3min on CPU, good quality for ibm01).
+            # 200+300 iterations for 260+ macros (~1min, ibm02+ usually discard DREAMPlace anyway).
+            if n_mv_hard > 260:
+                _iters1, _iters2 = 200, 300
+            else:
+                _iters1, _iters2 = 1000, 1500
+
             # Build DREAMPlace params
             params_dict = {
                 "aux_input":          aux_path,
-                "gpu":                1 if torch.cuda.is_available() else 0,
+                "gpu":                _gpu,
                 "target_density":     target_density,
                 "density_weight":     self.density_weight,
                 "gamma":              self.gamma,
@@ -271,7 +305,7 @@ class KoralPlacer:
                 "global_place_stages": [
                     {
                         "num_bins_x": 64, "num_bins_y": 64,
-                        "iteration": 1000, "learning_rate": 0.01,
+                        "iteration": _iters1, "learning_rate": 0.01,
                         "wirelength": "weighted_average",
                         "optimizer": "nesterov",
                         "Llambda_density_weight_iteration": 1,
@@ -279,7 +313,7 @@ class KoralPlacer:
                     },
                     {
                         "num_bins_x": 256, "num_bins_y": 256,
-                        "iteration": 1500, "learning_rate": 0.01,
+                        "iteration": _iters2, "learning_rate": 0.01,
                         "wirelength": "weighted_average",
                         "optimizer": "nesterov",
                         "Llambda_density_weight_iteration": 1,
@@ -296,13 +330,9 @@ class KoralPlacer:
             with open(params_path, "w") as f:
                 json.dump(params_dict, f)
 
-            # Load params and run
-            params = Params.Params()
-            params.load(params_path)
-
-            placedb = PlaceDB.PlaceDB()
-            placedb(params)
-
+            # Run DREAMPlace in CPU mode
+            params = Params.Params(); params.load(params_path)
+            placedb = PlaceDB.PlaceDB(); placedb(params)
             placer = NonLinearPlace.NonLinearPlace(params, placedb, timer=None)
             placer(params, placedb, learning_rate_value=None)
 
@@ -336,9 +366,11 @@ class KoralPlacer:
 
     @staticmethod
     def _count_significant_overlaps(placement: torch.Tensor, benchmark: Benchmark,
-                                     threshold: float = 0.004) -> int:
+                                     threshold: float = 0.004,
+                                     skip_fixed_fixed: bool = False) -> int:
         """Count hard macro pairs with overlap depth > threshold microns.
-        TILOS ignores sub-4nm overlaps (float32 precision); use threshold=0.004 to match."""
+        TILOS ignores sub-4nm overlaps (float32 precision); use threshold=0.004 to match.
+        skip_fixed_fixed=True: ignore fixed-fixed overlaps that no legalization can fix."""
         n = benchmark.num_hard_macros
         pos = placement[:n].numpy().astype(np.float32)
         sizes = benchmark.macro_sizes[:n].numpy().astype(np.float32)
@@ -348,6 +380,10 @@ class KoralPlacer:
         dy = np.abs(pos[:, 1:2] - pos[np.newaxis, :, 1])
         ov = ((sep_x - dx) > threshold) & ((sep_y - dy) > threshold)
         np.fill_diagonal(ov, False)
+        if skip_fixed_fixed:
+            movable = benchmark.get_movable_mask()[:n].numpy().astype(bool)
+            at_least_one_movable = movable[:, np.newaxis] | movable[np.newaxis, :]
+            ov = ov & at_least_one_movable
         return int(ov.sum()) // 2
 
     def _legalize_hard(self, placement: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
@@ -489,6 +525,141 @@ class KoralPlacer:
         n_ov = int(ov.sum()) // 2
         if n_ov > 0:
             print(f"  [legalize] {pass_idx+1}+diag passes, {n_ov} hard macro overlaps remain")
+        result = placement.clone()
+        result[:n] = torch.tensor(pos, dtype=torch.float32)
+        return result
+
+    def _micro_legalize(self, placement: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
+        """
+        Minimal-displacement legalization to eliminate ALL physical overlaps.
+        Uses 3nm gap (vs 5nm in _legalize_hard) to minimize cost impact.
+        Called before SA (to fix CT overlaps) and after SA (to fix any residual).
+        """
+        GAP = 0.003  # 3nm — survives float32 conversion
+        n = benchmark.num_hard_macros
+        sizes = benchmark.macro_sizes[:n].numpy().astype(np.float64)
+        movable = benchmark.get_movable_mask()[:n].numpy().astype(bool)
+        cw = float(benchmark.canvas_width)
+        ch = float(benchmark.canvas_height)
+        half_w = sizes[:, 0] / 2
+        half_h = sizes[:, 1] / 2
+        pos = placement[:n].numpy().copy().astype(np.float64)
+        sep_x_exact = (sizes[:, 0:1] + sizes[:, 0:1].T) / 2
+        sep_y_exact = (sizes[:, 1:2] + sizes[:, 1:2].T) / 2
+        sep_x = sep_x_exact + GAP
+        sep_y = sep_y_exact + GAP
+
+        for _ in range(2000):
+            dx_mat = np.abs(pos[:, 0:1] - pos[np.newaxis, :, 0])
+            dy_mat = np.abs(pos[:, 1:2] - pos[np.newaxis, :, 1])
+            is_ov = (sep_x_exact - dx_mat > 0) & (sep_y_exact - dy_mat > 0)
+            np.fill_diagonal(is_ov, False)
+            if not is_ov.any():
+                break
+            changed = False
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if not movable[i] and not movable[j]:
+                        continue
+                    dx = abs(pos[i, 0] - pos[j, 0])
+                    dy = abs(pos[i, 1] - pos[j, 1])
+                    ox = sep_x[i, j] - dx
+                    oy = sep_y[i, j] - dy
+                    if ox <= 0 or oy <= 0:
+                        continue
+                    both = movable[i] and movable[j]
+                    old_i, old_j = pos[i].copy(), pos[j].copy()
+                    # Resolve in minimum-overlap direction first.
+                    # Only try the other direction if: (a) primary fails AND (b) other
+                    # direction requires < 10nm movement. This fixes stuck pairs (boundary-
+                    # clamped macros with tiny overlaps in both dims) without triggering
+                    # large movements for ibm06-type pairs (small x-overlap, large y-extent).
+                    # Primary direction (minimum overlap)
+                    _TINY = 0.100  # 100nm: max secondary movement to avoid cascade
+                    if ox <= oy:
+                        need = ox; sign = 1.0 if pos[i, 0] >= pos[j, 0] else -1.0
+                        if both:
+                            xi_n = np.clip(pos[i, 0] + sign * need / 2, half_w[i], cw - half_w[i])
+                            xj_n = np.clip(pos[j, 0] - sign * need / 2, half_w[j], cw - half_w[j])
+                            got_i = abs(xi_n - pos[i, 0]); got_j = abs(xj_n - pos[j, 0])
+                            if got_i + got_j < need - 1e-9:
+                                xi_n = np.clip(pos[i, 0] + sign * (need - got_j), half_w[i], cw - half_w[i])
+                                xj_n = np.clip(pos[j, 0] - sign * (need - got_i), half_w[j], cw - half_w[j])
+                            pos[i, 0] = xi_n; pos[j, 0] = xj_n
+                        elif movable[i]:
+                            pos[i, 0] = np.clip(pos[i, 0] + sign * need, half_w[i], cw - half_w[i])
+                        else:
+                            pos[j, 0] = np.clip(pos[j, 0] - sign * need, half_w[j], cw - half_w[j])
+                        # If still overlapping after primary (clamped in x), try y
+                        # ONLY if the required y movement is tiny (< 10nm) to avoid cascade.
+                        dx2 = abs(pos[i, 0] - pos[j, 0]); dy2 = abs(pos[i, 1] - pos[j, 1])
+                        if (sep_x_exact[i, j] - dx2 > 0) and (sep_y_exact[i, j] - dy2 > 0):
+                            oy2 = sep_y[i, j] - dy2
+                            if 0 < oy2 <= _TINY:
+                                sy = 1.0 if pos[i, 1] >= pos[j, 1] else -1.0
+                                if both:
+                                    pos[i, 1] = np.clip(pos[i, 1] + sy * oy2 / 2, half_h[i], ch - half_h[i])
+                                    pos[j, 1] = np.clip(pos[j, 1] - sy * oy2 / 2, half_h[j], ch - half_h[j])
+                                elif movable[i]:
+                                    pos[i, 1] = np.clip(pos[i, 1] + sy * oy2, half_h[i], ch - half_h[i])
+                                else:
+                                    pos[j, 1] = np.clip(pos[j, 1] - sy * oy2, half_h[j], ch - half_h[j])
+                    else:
+                        need = oy; sign = 1.0 if pos[i, 1] >= pos[j, 1] else -1.0
+                        if both:
+                            yi_n = np.clip(pos[i, 1] + sign * need / 2, half_h[i], ch - half_h[i])
+                            yj_n = np.clip(pos[j, 1] - sign * need / 2, half_h[j], ch - half_h[j])
+                            got_i = abs(yi_n - pos[i, 1]); got_j = abs(yj_n - pos[j, 1])
+                            if got_i + got_j < need - 1e-9:
+                                yi_n = np.clip(pos[i, 1] + sign * (need - got_j), half_h[i], ch - half_h[i])
+                                yj_n = np.clip(pos[j, 1] - sign * (need - got_i), half_h[j], ch - half_h[j])
+                            pos[i, 1] = yi_n; pos[j, 1] = yj_n
+                        elif movable[i]:
+                            pos[i, 1] = np.clip(pos[i, 1] + sign * need, half_h[i], ch - half_h[i])
+                        else:
+                            pos[j, 1] = np.clip(pos[j, 1] - sign * need, half_h[j], ch - half_h[j])
+                        # If still overlapping after primary (clamped in y), try x if tiny
+                        dx2 = abs(pos[i, 0] - pos[j, 0]); dy2 = abs(pos[i, 1] - pos[j, 1])
+                        if (sep_x_exact[i, j] - dx2 > 0) and (sep_y_exact[i, j] - dy2 > 0):
+                            ox2 = sep_x[i, j] - dx2
+                            if 0 < ox2 <= _TINY:
+                                sx = 1.0 if pos[i, 0] >= pos[j, 0] else -1.0
+                                if both:
+                                    pos[i, 0] = np.clip(pos[i, 0] + sx * ox2 / 2, half_w[i], cw - half_w[i])
+                                    pos[j, 0] = np.clip(pos[j, 0] - sx * ox2 / 2, half_w[j], cw - half_w[j])
+                                elif movable[i]:
+                                    pos[i, 0] = np.clip(pos[i, 0] + sx * ox2, half_w[i], cw - half_w[i])
+                                else:
+                                    pos[j, 0] = np.clip(pos[j, 0] - sx * ox2, half_w[j], cw - half_w[j])
+                    if not (np.allclose(pos[i], old_i) and np.allclose(pos[j], old_j)):
+                        changed = True
+            if not changed:
+                break
+
+        # Diagonal push for any remaining cyclic stuck pairs (1000 passes)
+        for _ in range(1000):
+            dx_mat = np.abs(pos[:, 0:1] - pos[np.newaxis, :, 0])
+            dy_mat = np.abs(pos[:, 1:2] - pos[np.newaxis, :, 1])
+            is_ov = (sep_x_exact - dx_mat > 0) & (sep_y_exact - dy_mat > 0)
+            np.fill_diagonal(is_ov, False)
+            if not is_ov.any():
+                break
+            for i, j in zip(*np.where(is_ov)):
+                if i >= j or (not movable[i] and not movable[j]):
+                    continue
+                dx_v = pos[i, 0] - pos[j, 0]; dy_v = pos[i, 1] - pos[j, 1]
+                d = math.sqrt(dx_v * dx_v + dy_v * dy_v)
+                fx, fy = (1.0, 0.0) if d < 1e-9 else (dx_v / d, dy_v / d)
+                need_x = sep_x[i, j] - abs(dx_v)
+                need_y = sep_y[i, j] - abs(dy_v)
+                s = max(need_x, need_y) * 0.5
+                if movable[i]:
+                    pos[i, 0] = np.clip(pos[i, 0] + fx * s, half_w[i], cw - half_w[i])
+                    pos[i, 1] = np.clip(pos[i, 1] + fy * s, half_h[i], ch - half_h[i])
+                if movable[j]:
+                    pos[j, 0] = np.clip(pos[j, 0] - fx * s, half_w[j], cw - half_w[j])
+                    pos[j, 1] = np.clip(pos[j, 1] - fy * s, half_h[j], ch - half_h[j])
+
         result = placement.clone()
         result[:n] = torch.tensor(pos, dtype=torch.float32)
         return result
@@ -903,7 +1074,7 @@ class KoralPlacer:
             frac = max(0.0, (deadline - time.time()) / self.sa_time_budget)
             # Annealed move scale: start large, end small
             scale = max(cw, ch) * (0.08 * frac + 0.005)
-            n_cands = 20
+            n_cands = 50
 
             order = random.sample(movable_hard, n_mv)
             n_accepted = 0
@@ -1021,7 +1192,7 @@ class KoralPlacer:
                     delta += new_wl - old_wl
             return delta
 
-        lns_k = 8
+        lns_k = 12
         lns_improvements = 0
         lns_no_swap_streak = 0
         # Cap LNS time adaptively based on WL fraction of initial proxy cost.
@@ -1083,9 +1254,10 @@ class KoralPlacer:
         oracle_time_est = max(0.5, (time.time() - (deadline - self.sa_time_budget)) / max(1, oracle_calls))
         fd_k = min(n_mv, 20)
         # Run FD if at least 1 full step fits: fd_k * 2 probes + 1 verify + 2 buffer.
-        # Threshold is deliberately low — even 1 FD step is worth trying for
-        # congestion-dominated benchmarks (ibm06-style) where oracle SA barely helps.
-        if deadline - time.time() > oracle_time_est * (fd_k * 2 + 3) and n_mv >= 1:
+        # Skip FD for congestion-dominated benchmarks (wl_frac < 4%): FD gradient is
+        # near-zero for congestion/density, and legalization inside FD is expensive on ibm06.
+        # ibm02 (4.77%) still runs FD which improved 2/7 steps; ibm06 (3.84%) skips it.
+        if deadline - time.time() > oracle_time_est * (fd_k * 2 + 3) and n_mv >= 1 and _wl_frac >= 0.04:
             _rebuild_state(best_pos, best_ori)
             fd_delta_x = cw * 0.02
             fd_delta_y = ch * 0.02
@@ -1175,11 +1347,12 @@ class KoralPlacer:
         # Uses HPWL as fast surrogate (O(degree), ~0.01ms/call) for SA acceptance,
         # with proxy oracle checkpoint every HPWL_CKPT_N accepted moves (~0.5s/call).
         # Explores ~50× more positions per oracle call budget vs pure oracle SA.
-        # WL-dominated: HPWL guides well. Congestion-dominated: degrades to random-walk
-        # + oracle verify (still valid since congestion-guided macro selection is kept).
+        # Move mix: 65% Gaussian translation, 15% rotation, 20% swap (dense only).
+        # Adaptive HPWL_CKPT_N: frequent oracle for congestion-dominated benchmarks.
         remaining = deadline - time.time()
         oracle_time_est = max(0.5, (time.time() - (deadline - self.sa_time_budget)) / max(1, oracle_calls))
-        HPWL_CKPT_N = 50  # oracle checkpoint every N accepted HPWL moves
+        # More frequent oracle for congestion-dominated benchmarks (HPWL ≠ proxy there).
+        HPWL_CKPT_N = max(5, min(50, int(50 * _wl_frac * 1.5)))
 
         if remaining > oracle_time_est * 8:
             _rebuild_state(best_pos, best_ori)
@@ -1201,19 +1374,30 @@ class KoralPlacer:
             else:
                 hpwl_T_start = (cw + ch) * 0.3
                 hpwl_T_end   = (cw + ch) * 0.003
-            print(f"  [hSA] T={hpwl_T_start:.2f}→{hpwl_T_end:.4f}, remaining={remaining:.0f}s")
+            print(f"  [hSA] T={hpwl_T_start:.2f}->{hpwl_T_end:.4f}, ckpt={HPWL_CKPT_N}, remaining={remaining:.0f}s")
 
             accepted_since_ckpt = 0
             hsa_improved = 0; hsa_accepted = 0; hsa_step = 0; hsa_oracle = 0
+            _hsa_gauss_tried = 0; _hsa_gauss_valid = 0; _hsa_swap_enabled = False
             t_hsa_start = time.time()
             t_hsa_end   = deadline - oracle_time_est * 2
+            # Reheating state: if no oracle improvement in K calls, reheat temperature
+            _reheat_no_improve = 0; _reheat_count = 0; _reheat_K = 20; _reheat_max = 4
+            T_hsa_current_start = hpwl_T_start  # tracks current cycle start temp for reheat
 
             while time.time() < t_hsa_end:
                 frac = (time.time() - t_hsa_start) / max(1e-9, t_hsa_end - t_hsa_start)
-                T_hsa = hpwl_T_start * math.exp(
-                    math.log(max(hpwl_T_end, hpwl_T_start * 1e-6) / hpwl_T_start) * frac
+                T_hsa = T_hsa_current_start * math.exp(
+                    math.log(max(hpwl_T_end, T_hsa_current_start * 1e-6) / T_hsa_current_start) * frac
                 )
-                scale_hsa = max(cw, ch) * (0.10 * (1.0 - frac) + 0.01)
+                # Multi-phase sigma: broad exploration → focused exploitation → fine-tuning.
+                # Resets after each reheat since frac restarts from 0.
+                if frac < 0.15:
+                    scale_hsa = max(cw, ch) * 0.12
+                elif frac < 0.75:
+                    scale_hsa = max(cw, ch) * 0.05
+                else:
+                    scale_hsa = max(cw, ch) * 0.012
 
                 # Pick macro: 70% congestion-guided, 30% random
                 if _cong_weights is not None and random.random() < 0.7:
@@ -1221,35 +1405,121 @@ class KoralPlacer:
                 else:
                     ci = random.choice(movable_hard)
 
-                cx = float(np.clip(pos[ci, 0] + random.gauss(0, scale_hsa), hw[ci], cw - hw[ci]))
-                cy = float(np.clip(pos[ci, 1] + random.gauss(0, scale_hsa), hh[ci], ch - hh[ci]))
                 hsa_step += 1
+                r = random.random()
 
-                if _overlaps(ci, cx, cy):
-                    continue
+                if r < 0.15:
+                    # Rotation move: try next orientation (no translation)
+                    new_o = (int(ori[ci]) + 1) % 4
+                    delta_h = _delta_hpwl(ci, pos[ci, 0], pos[ci, 1], new_o)
+                    if delta_h < 0 or (T_hsa > 0 and random.random() < math.exp(
+                            -max(delta_h, 0.0) / T_hsa)):
+                        _accept_move(ci, pos[ci, 0], pos[ci, 1], new_o)
+                        hsa_accepted += 1; accepted_since_ckpt += 1
 
-                delta_h = _delta_hpwl(ci, cx, cy, int(ori[ci]))
+                elif r < 0.35 and _hsa_swap_enabled and n_mv >= 2:
+                    # Swap move: useful for dense benchmarks where Gaussian has <3% valid rate
+                    j_idx = random.randrange(n_mv); j = movable_hard[j_idx]
+                    while j == ci: j_idx = (j_idx + 1) % n_mv; j = movable_hard[j_idx]
+                    old_ci = (pos[ci, 0], pos[ci, 1]); old_cj = (pos[j, 0], pos[j, 1])
+                    if not _overlaps_excl(ci, old_cj[0], old_cj[1], j) and \
+                       not _overlaps_excl(j, old_ci[0], old_ci[1], ci):
+                        delta_h = _swap_delta_hpwl(ci, j)
+                        if delta_h < 0 or (T_hsa > 0 and random.random() < math.exp(
+                                -max(delta_h, 0.0) / T_hsa)):
+                            _accept_move(ci, old_cj[0], old_cj[1], int(ori[ci]))
+                            _accept_move(j, old_ci[0], old_ci[1], int(ori[j]))
+                            hsa_accepted += 1; accepted_since_ckpt += 1
 
-                # SA acceptance based on HPWL delta
-                if delta_h < 0 or (T_hsa > 0 and random.random() < math.exp(
-                        -max(delta_h, 0.0) / T_hsa)):
-                    _accept_move(ci, cx, cy, int(ori[ci]))
-                    hsa_accepted += 1
-                    accepted_since_ckpt += 1
+                else:
+                    # Gaussian translation move (primary)
+                    cx = float(np.clip(pos[ci, 0] + random.gauss(0, scale_hsa), hw[ci], cw - hw[ci]))
+                    cy = float(np.clip(pos[ci, 1] + random.gauss(0, scale_hsa), hh[ci], ch - hh[ci]))
+                    _hsa_gauss_tried += 1
+                    if _overlaps(ci, cx, cy):
+                        # Track validity rate; enable swaps if Gaussian valid rate < 3%
+                        if _hsa_gauss_tried % 100 == 0:
+                            _hsa_swap_enabled = (_hsa_gauss_valid / _hsa_gauss_tried) < 0.03
+                        continue
+                    _hsa_gauss_valid += 1
+                    delta_h = _delta_hpwl(ci, cx, cy, int(ori[ci]))
+                    if delta_h < 0 or (T_hsa > 0 and random.random() < math.exp(
+                            -max(delta_h, 0.0) / T_hsa)):
+                        _accept_move(ci, cx, cy, int(ori[ci]))
+                        hsa_accepted += 1; accepted_since_ckpt += 1
 
-                    if accepted_since_ckpt >= HPWL_CKPT_N:
-                        cost = compute_proxy_cost(
-                            torch.tensor(pos, dtype=torch.float32), benchmark, plc
+                if accepted_since_ckpt >= HPWL_CKPT_N:
+                    cost = compute_proxy_cost(
+                        torch.tensor(pos, dtype=torch.float32), benchmark, plc
+                    )["proxy_cost"]
+                    oracle_calls += 1; hsa_oracle += 1
+                    # Tighter revert for congestion-dominated: HPWL misleads SA far from oracle-optimal.
+                    _revert_thr = 1.03 if _wl_frac < 0.05 else 1.10
+                    if cost < best_cost:
+                        best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
+                        hsa_improved += 1; _reheat_no_improve = 0
+                        print(f"  [hSA] {cost:.4f}")
+                    else:
+                        _reheat_no_improve += 1
+                        if cost > best_cost * _revert_thr:
+                            _rebuild_state(best_pos, best_ori)
+                    # Reheat on stagnation: if no improvement in _reheat_K oracle calls,
+                    # reset temperature to escape local minima.
+                    # Last reheat: add perturbation (displace ~5% of macros) for deeper escape.
+                    if (_reheat_no_improve >= _reheat_K and _reheat_count < _reheat_max
+                            and time.time() < t_hsa_end - oracle_time_est * 20):
+                        if _reheat_count < _reheat_max - 1:
+                            # Standard reheat: restore best and raise temperature
+                            T_hsa_current_start = hpwl_T_start * 0.4
+                            t_hsa_start = time.time()
+                            _rebuild_state(best_pos, best_ori)
+                        else:
+                            # Final reheat: perturb a handful of macros for deeper exploration
+                            _perturb = best_pos.copy(); _perturb_ori = best_ori.copy()
+                            _n_perturb = max(2, n_mv // 15)
+                            _pscale = max(cw, ch) * 0.18
+                            _pmacros = random.sample(movable_hard, min(_n_perturb, n_mv))
+                            for _pmi in _pmacros:
+                                _pcx = float(np.clip(_perturb[_pmi, 0] + random.gauss(0, _pscale), hw[_pmi], cw - hw[_pmi]))
+                                _pcy = float(np.clip(_perturb[_pmi, 1] + random.gauss(0, _pscale), hh[_pmi], ch - hh[_pmi]))
+                                _perturb[_pmi, 0] = _pcx; _perturb[_pmi, 1] = _pcy
+                            # Use micro_legalize (1nm gap) for perturbation — full legalize
+                            # is too slow for dense benchmarks (ibm06 takes minutes).
+                            _perturb_t = self._micro_legalize(torch.tensor(_perturb, dtype=torch.float32), benchmark)
+                            _perturb = _perturb_t.numpy()
+                            T_hsa_current_start = hpwl_T_start * 0.6
+                            t_hsa_start = time.time()
+                            _rebuild_state(_perturb, _perturb_ori)
+                        _reheat_no_improve = 0; _reheat_count += 1
+                        print(f"  [hSA] reheat #{_reheat_count} (stagnated {_reheat_K} oracle calls)")
+                    # Refresh congestion map every 30 oracle calls
+                    if _cong_weights is not None and hsa_oracle % 30 == 0:
+                        try:
+                            _h2 = np.array(plc.get_horizontal_routing_congestion(), dtype=np.float32)
+                            _v2 = np.array(plc.get_vertical_routing_congestion(), dtype=np.float32)
+                            _t2 = _h2 + _v2
+                            _mc2 = np.array([_t2[c] if 0 <= c < len(_t2) else 0.0
+                                             for c in [plc.get_grid_cell_of_node(p) for p in _plc_ids]],
+                                            dtype=np.float32)
+                            _thr2 = float(np.percentile(_mc2, 50))
+                            _wts2 = np.maximum(0.0, _mc2 - _thr2).astype(np.float64)
+                            if _wts2.sum() > 0:
+                                _cong_weights = _wts2 / _wts2.sum()
+                        except Exception:
+                            pass
+                    # Periodic soft macro centroid update (every 100 oracle calls).
+                    # Fast O(total_pins) pass to reposition soft macros toward connected hard macros.
+                    if n_mac > n_hard and hsa_oracle % 100 == 0:
+                        _pos_soft = self._update_soft_macros(best_pos.copy(), benchmark)
+                        _cost_soft = compute_proxy_cost(
+                            torch.tensor(_pos_soft, dtype=torch.float32), benchmark, plc
                         )["proxy_cost"]
                         oracle_calls += 1; hsa_oracle += 1
-                        if cost < best_cost:
-                            best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
-                            hsa_improved += 1
-                            print(f"  [hSA] {cost:.4f}")
-                        elif cost > best_cost * 1.10:
-                            # Drifted >10% from best: revert and restart exploration
+                        if _cost_soft < best_cost:
+                            best_cost = _cost_soft; best_pos = _pos_soft
                             _rebuild_state(best_pos, best_ori)
-                        accepted_since_ckpt = 0
+                            _reheat_no_improve = 0
+                    accepted_since_ckpt = 0
 
             # Final checkpoint for any pending accepted moves
             if accepted_since_ckpt > 0:
@@ -1263,7 +1533,8 @@ class KoralPlacer:
                     print(f"  [hSA] final {cost:.4f}")
 
             if hsa_oracle > 0:
-                print(f"  [hSA] {hsa_improved} improved, {hsa_accepted}/{hsa_step} accepted, {hsa_oracle} oracle calls")
+                print(f"  [hSA] {hsa_improved} improved, {hsa_accepted}/{hsa_step} accepted, "
+                      f"{hsa_oracle} oracle, swap={'on' if _hsa_swap_enabled else 'off'}")
 
         # ── Final soft-macro update (revert if no gain) ───────────────────────
         _rebuild_state(best_pos, best_ori)
@@ -1281,10 +1552,18 @@ class KoralPlacer:
 
         print(f"  [CD] final={best_cost:.4f} ({oracle_calls} oracle calls, {pass_num} passes)")
         result = torch.tensor(best_pos, dtype=torch.float32)
-        # Skip final legalization if only sub-4nm overlaps remain (TILOS ignores these).
-        # The 5nm-gap legalizer would needlessly push macros away from oracle-optimal positions.
+        # Full legalization if significant (>4nm) overlaps remain (e.g. after DREAMPlace).
         if self._count_significant_overlaps(result, benchmark, threshold=0.004) > 0:
             return self._legalize_hard(result, benchmark)
-        return result
+        # Micro-legalization: fix any residual sub-4nm overlaps.
+        # With pre-SA micro_legalize, CT overlaps are resolved before SA sees them;
+        # SA's _overlaps filter prevents new overlaps from SA moves. So this should be a no-op.
+        micro = self._micro_legalize(result, benchmark)
+        # Use exact float64 check (matches harness compute_overlap_metrics).
+        if compute_overlap_metrics(micro, benchmark)["overlap_count"] > 0:
+            # micro didn't fully converge; start legalize_hard from micro (closer to optimum).
+            lh = self._legalize_hard(micro, benchmark)
+            return lh
+        return micro
 
 

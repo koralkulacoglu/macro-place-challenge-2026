@@ -21,6 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /challenge
 
+# Use bash for all subsequent RUN commands (dash default doesn't support pipefail)
+SHELL ["/bin/bash", "-c"]
+
 # Challenge framework
 COPY macro_place /challenge/macro_place
 COPY pyproject.toml requirements.txt /challenge/
