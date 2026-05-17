@@ -113,7 +113,12 @@ class KoralPlacer:
         # Start from CT positions, then try DREAMPlace if available.
         # CT positions: already near-optimal from Circuit Training (good congestion/density).
         ct = benchmark.macro_positions.clone()
-        ct_legal = self._legalize_hard(ct, benchmark)
+        # Skip legalization if CT has only sub-4nm overlaps (TILOS ignores these;
+        # our 5nm-gap legalizer would push macros and cost +0.27 proxy on ibm06).
+        if self._count_significant_overlaps(ct, benchmark, threshold=0.004) > 0:
+            ct_legal = self._legalize_hard(ct, benchmark)
+        else:
+            ct_legal = ct
 
         placement = ct_legal  # default: CT positions
 
@@ -150,6 +155,25 @@ class KoralPlacer:
                         print(f"  [start] DREAMPlace({tag}) {dp_cost:.4f} >= best {best_dp_cost:.4f}")
                 except Exception as e:
                     print(f"  [start] DREAMPlace({tag}) failed: {e}")
+
+            # CT-init DREAMPlace: start from CT positions (.pl file), not random center.
+            # Top teams use this approach — DREAMPlace refines congestion-aware CT positions.
+            try:
+                dp_ct = self._run_dreamplace(benchmark, center_init=False,
+                                             fix_soft=False, dp_seed=self.seed)
+                dp_ct = self._legalize_hard(dp_ct, benchmark)
+                if self._count_hard_overlaps_f32(dp_ct, benchmark) == 0 and plc is not None:
+                    dp_ct_cost = compute_proxy_cost(dp_ct, benchmark, plc)["proxy_cost"]
+                    if dp_ct_cost < best_dp_cost:
+                        print(f"  [start] DREAMPlace(CT-init) {dp_ct_cost:.4f} < best {best_dp_cost:.4f}")
+                        best_dp_cost = dp_ct_cost
+                        best_placement = dp_ct
+                    else:
+                        print(f"  [start] DREAMPlace(CT-init) {dp_ct_cost:.4f} >= best {best_dp_cost:.4f}")
+                else:
+                    print("  [start] DREAMPlace(CT-init) overlaps remain, skipping")
+            except Exception as e:
+                print(f"  [start] DREAMPlace(CT-init) failed: {e}")
 
             placement = best_placement
 
@@ -307,6 +331,22 @@ class KoralPlacer:
         dx = np.abs(pos[:, 0:1] - pos[np.newaxis, :, 0])
         dy = np.abs(pos[:, 1:2] - pos[np.newaxis, :, 1])
         ov = (sep_x - dx > 0) & (sep_y - dy > 0)
+        np.fill_diagonal(ov, False)
+        return int(ov.sum()) // 2
+
+    @staticmethod
+    def _count_significant_overlaps(placement: torch.Tensor, benchmark: Benchmark,
+                                     threshold: float = 0.004) -> int:
+        """Count hard macro pairs with overlap depth > threshold microns.
+        TILOS ignores sub-4nm overlaps (float32 precision); use threshold=0.004 to match."""
+        n = benchmark.num_hard_macros
+        pos = placement[:n].numpy().astype(np.float32)
+        sizes = benchmark.macro_sizes[:n].numpy().astype(np.float32)
+        sep_x = (sizes[:, 0:1] + sizes[:, 0:1].T) / 2
+        sep_y = (sizes[:, 1:2] + sizes[:, 1:2].T) / 2
+        dx = np.abs(pos[:, 0:1] - pos[np.newaxis, :, 0])
+        dy = np.abs(pos[:, 1:2] - pos[np.newaxis, :, 1])
+        ov = ((sep_x - dx) > threshold) & ((sep_y - dy) > threshold)
         np.fill_diagonal(ov, False)
         return int(ov.sum()) // 2
 
@@ -1131,139 +1171,99 @@ class KoralPlacer:
                 print(f"  [FD] {fd_improved}/{fd_step} steps improved, best={best_cost:.4f}")
             _rebuild_state(best_pos, best_ori)
 
-        # ── Oracle-guided SA fallback (uses remaining time after CD+LNS+FD exit) ──────
+        # ── HPWL-guided SA with periodic oracle checkpoints ──────────────────────
+        # Uses HPWL as fast surrogate (O(degree), ~0.01ms/call) for SA acceptance,
+        # with proxy oracle checkpoint every HPWL_CKPT_N accepted moves (~0.5s/call).
+        # Explores ~50× more positions per oracle call budget vs pure oracle SA.
+        # WL-dominated: HPWL guides well. Congestion-dominated: degrades to random-walk
+        # + oracle verify (still valid since congestion-guided macro selection is kept).
         remaining = deadline - time.time()
         oracle_time_est = max(0.5, (time.time() - (deadline - self.sa_time_budget)) / max(1, oracle_calls))
-        # Use remaining time as primary control; n_osa_budget is just an upper bound
-        # (many iterations are rejected for overlap; time check is the real exit)
-        n_osa_budget = max(int(remaining / oracle_time_est) * 5, 100000)
+        HPWL_CKPT_N = 50  # oracle checkpoint every N accepted HPWL moves
+
         if remaining > oracle_time_est * 8:
             _rebuild_state(best_pos, best_ori)
-            T_start = best_cost * 0.04
-            T_end   = best_cost * 0.002
-            osa_accepted = 0; osa_improved = 0; osa_step = 0
-            t_osa_start = time.time()
-            t_osa_end   = deadline - oracle_time_est * 3
-            # Adaptive cluster size: start at k_osa_max, reduce if valid rate is too low.
-            # Dense benchmarks (ibm09 P_valid=2.8%) need k=1; sparse (ibm01) benefit from k>1.
-            # k=6 cluster moves need n_mv >> 240 to justify the overlap rejection overhead.
-            # For medium benchmarks (ibm02: 271 macros), k=6 gives only ~5% valid rate → 95%
-            # wasted iterations. Use k=1 (single-macro) for all but very large benchmarks.
-            # ibm09 (dense, ~270 macros): single-macro P_valid=2.8% → swap_enabled kicks in.
-            k_osa_max = 1  # single-macro moves; clusters only cause overhead for ibm-range N
-            k_osa_cur = k_osa_max
-            _valid_trials = 0; _total_trials = 0  # for adaptive k
-            _gauss_trials = 0; _gauss_valid_cnt = 0; _swap_enabled = False
-            for osa_step in range(n_osa_budget):
-                t_now = time.time()
-                if t_now >= t_osa_end:
-                    break
-                # Time-based temperature: anneal from T_start→T_end over the oracle SA window
-                frac = (t_now - t_osa_start) / max(1e-9, t_osa_end - t_osa_start)
-                T = T_start * math.exp(math.log(T_end / T_start) * frac)
-                scale_osa = max(cw, ch) * (0.10 * (1 - frac) + 0.01)
 
-                # Pick cluster center: 70% congestion-guided, 30% random
+            # Calibrate HPWL temperature from distribution of |delta_hpwl| on random valid moves
+            sample_deltas = []
+            for _ in range(min(400, n_mv * 20)):
+                i = random.choice(movable_hard)
+                cx = float(np.clip(pos[i, 0] + random.gauss(0, max(cw, ch) * 0.08), hw[i], cw - hw[i]))
+                cy = float(np.clip(pos[i, 1] + random.gauss(0, max(cw, ch) * 0.08), hh[i], ch - hh[i]))
+                if not _overlaps(i, cx, cy):
+                    d = abs(_delta_hpwl(i, cx, cy, int(ori[i])))
+                    if d > 0:
+                        sample_deltas.append(d)
+
+            if len(sample_deltas) >= 10:
+                hpwl_T_start = float(np.percentile(sample_deltas, 60)) * 2.0
+                hpwl_T_end   = float(np.percentile(sample_deltas,  5)) * 0.05
+            else:
+                hpwl_T_start = (cw + ch) * 0.3
+                hpwl_T_end   = (cw + ch) * 0.003
+            print(f"  [hSA] T={hpwl_T_start:.2f}→{hpwl_T_end:.4f}, remaining={remaining:.0f}s")
+
+            accepted_since_ckpt = 0
+            hsa_improved = 0; hsa_accepted = 0; hsa_step = 0; hsa_oracle = 0
+            t_hsa_start = time.time()
+            t_hsa_end   = deadline - oracle_time_est * 2
+
+            while time.time() < t_hsa_end:
+                frac = (time.time() - t_hsa_start) / max(1e-9, t_hsa_end - t_hsa_start)
+                T_hsa = hpwl_T_start * math.exp(
+                    math.log(max(hpwl_T_end, hpwl_T_start * 1e-6) / hpwl_T_start) * frac
+                )
+                scale_hsa = max(cw, ch) * (0.10 * (1.0 - frac) + 0.01)
+
+                # Pick macro: 70% congestion-guided, 30% random
                 if _cong_weights is not None and random.random() < 0.7:
-                    ci_idx = int(np.random.choice(n_mv, p=_cong_weights))
-                    ci = movable_hard[ci_idx]
+                    ci = movable_hard[int(np.random.choice(n_mv, p=_cong_weights))]
                 else:
                     ci = random.choice(movable_hard)
-                # Adapt cluster size every 50 trials: reduce k if valid rate too low
-                _total_trials += 1
-                if _total_trials % 50 == 0 and _total_trials > 0:
-                    vrate = _valid_trials / _total_trials
-                    # Reduce k when overhead > 10% of oracle time:
-                    # overhead_per_oracle ≈ oracle_time_est * 0.1 → P_valid_threshold = 0.003%
-                    p_thresh = max(0.0003, 0.001 / oracle_time_est)
-                    if vrate < p_thresh and k_osa_cur > 1:
-                        k_osa_cur = max(1, k_osa_cur - 1)  # too dense: shrink cluster
-                    elif vrate > 0.2 and k_osa_cur < k_osa_max:
-                        k_osa_cur = min(k_osa_max, k_osa_cur + 1)  # sparse: grow cluster
 
-                if k_osa_cur > 1:
-                    dists_osa = sorted([(abs(pos[j,0]-pos[ci,0])+abs(pos[j,1]-pos[ci,1]), j)
-                                        for j in movable_hard if j != ci])
-                    cluster = [ci] + [j for _, j in dists_osa[:k_osa_cur - 1]]
-                else:
-                    cluster = [ci]
+                cx = float(np.clip(pos[ci, 0] + random.gauss(0, scale_hsa), hw[ci], cw - hw[ci]))
+                cy = float(np.clip(pos[ci, 1] + random.gauss(0, scale_hsa), hh[ci], ch - hh[ci]))
+                hsa_step += 1
 
-                # Swap moves: only for dense benchmarks where Gaussian valid rate < 3%.
-                # (ibm09-style: k=6 cluster P_valid≈0, swaps guarantee oracle call rate)
-                # Disabled for sparse/moderate benchmarks (ibm02) where Gaussian is better.
-                if n_mv >= 2 and _swap_enabled and random.random() < 0.30:
-                    # Directed swap: ci = high-cong (already selected above),
-                    # j = low-cong (70%) or random (30%) for congestion-reducing swaps
-                    if _inv_weights is not None and random.random() < 0.7:
-                        j_idx = int(np.random.choice(n_mv, p=_inv_weights))
-                        j = movable_hard[j_idx]
-                    else:
-                        j_idx = random.randrange(n_mv)
-                        j = movable_hard[j_idx]
-                    if j == ci:
-                        j_idx = (j_idx + 1) % n_mv
-                        j = movable_hard[j_idx]
-                    # Swap positions (always valid since both positions were already legal)
-                    old_cxs = [float(pos[ci,0]), float(pos[j,0])]
-                    old_cys = [float(pos[ci,1]), float(pos[j,1])]
-                    pos[ci,0], pos[ci,1] = old_cxs[1], old_cys[1]
-                    pos[j,0],  pos[j,1]  = old_cxs[0], old_cys[0]
-                    cluster = [ci, j]
-                    _valid_trials += 1
-                else:
-                    # Save old positions and generate Gaussian candidates
-                    old_cxs = [float(pos[i,0]) for i in cluster]
-                    old_cys = [float(pos[i,1]) for i in cluster]
-                    new_cxs = [float(np.clip(pos[i,0]+random.gauss(0,scale_osa), hw[i], cw-hw[i])) for i in cluster]
-                    new_cys = [float(np.clip(pos[i,1]+random.gauss(0,scale_osa), hh[i], ch-hh[i])) for i in cluster]
+                if _overlaps(ci, cx, cy):
+                    continue
 
-                    # Apply moves temporarily to pos, then check all cluster overlaps at once
-                    for k_idx, i in enumerate(cluster):
-                        pos[i,0] = new_cxs[k_idx]; pos[i,1] = new_cys[k_idx]
-                    _gauss_trials += 1
-                    valid_cluster = all(not _overlaps(i, pos[i,0], pos[i,1]) for i in cluster)
-                    if not valid_cluster:
-                        for k_idx, i in enumerate(cluster):
-                            pos[i,0] = old_cxs[k_idx]; pos[i,1] = old_cys[k_idx]
-                        # Dense-mode check: enable swaps when Gaussian valid rate < 3%
-                        if _gauss_trials % 100 == 0 and _gauss_trials >= 100:
-                            _swap_enabled = (_gauss_valid_cnt / _gauss_trials) < 0.03
-                        continue
-                    _gauss_valid_cnt += 1
-                    _valid_trials += 1
+                delta_h = _delta_hpwl(ci, cx, cy, int(ori[ci]))
 
+                # SA acceptance based on HPWL delta
+                if delta_h < 0 or (T_hsa > 0 and random.random() < math.exp(
+                        -max(delta_h, 0.0) / T_hsa)):
+                    _accept_move(ci, cx, cy, int(ori[ci]))
+                    hsa_accepted += 1
+                    accepted_since_ckpt += 1
+
+                    if accepted_since_ckpt >= HPWL_CKPT_N:
+                        cost = compute_proxy_cost(
+                            torch.tensor(pos, dtype=torch.float32), benchmark, plc
+                        )["proxy_cost"]
+                        oracle_calls += 1; hsa_oracle += 1
+                        if cost < best_cost:
+                            best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
+                            hsa_improved += 1
+                            print(f"  [hSA] {cost:.4f}")
+                        elif cost > best_cost * 1.10:
+                            # Drifted >10% from best: revert and restart exploration
+                            _rebuild_state(best_pos, best_ori)
+                        accepted_since_ckpt = 0
+
+            # Final checkpoint for any pending accepted moves
+            if accepted_since_ckpt > 0:
                 cost = compute_proxy_cost(
                     torch.tensor(pos, dtype=torch.float32), benchmark, plc
                 )["proxy_cost"]
-                oracle_calls += 1
-                delta = cost - best_cost
-                if delta < 0 or (T > 0 and random.random() < math.exp(-delta / T)):
-                    osa_accepted += 1
-                    if cost < best_cost:
-                        best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
-                        osa_improved += 1
-                        print(f"  [oSA] {cost:.4f} (step {osa_step})")
-                    # Refresh congestion map every 30 oracle calls (plc is at current pos)
-                    if _cong_weights is not None and oracle_calls % 30 == 0:
-                        try:
-                            _h_cong  = np.array(plc.get_horizontal_routing_congestion(), dtype=np.float32)
-                            _v_cong  = np.array(plc.get_vertical_routing_congestion(), dtype=np.float32)
-                            _total   = _h_cong + _v_cong
-                            _cells   = [plc.get_grid_cell_of_node(pid) for pid in _plc_ids]
-                            _mc      = np.array([_total[c] if 0 <= c < len(_total) else 0.0 for c in _cells])
-                            _thr     = float(np.percentile(_mc, 50))
-                            _wts     = np.maximum(0.0, _mc - _thr).astype(np.float64)
-                            if _wts.sum() > 0:
-                                _cong_weights = _wts / _wts.sum()
-                                _inv_wts2 = 1.0 / (_cong_weights + 1e-9)
-                                _inv_weights = (_inv_wts2 / _inv_wts2.sum()).astype(np.float64)
-                        except Exception:
-                            pass
-                else:
-                    for k_idx, i in enumerate(cluster):
-                        pos[i,0] = old_cxs[k_idx]; pos[i,1] = old_cys[k_idx]
-            if osa_improved > 0 or osa_accepted > 0:
-                print(f"  [oSA] {osa_improved} improved, {osa_accepted}/{osa_step+1} accepted (k={k_osa_cur})")
+                oracle_calls += 1; hsa_oracle += 1
+                if cost < best_cost:
+                    best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
+                    hsa_improved += 1
+                    print(f"  [hSA] final {cost:.4f}")
+
+            if hsa_oracle > 0:
+                print(f"  [hSA] {hsa_improved} improved, {hsa_accepted}/{hsa_step} accepted, {hsa_oracle} oracle calls")
 
         # ── Final soft-macro update (revert if no gain) ───────────────────────
         _rebuild_state(best_pos, best_ori)
@@ -1281,10 +1281,9 @@ class KoralPlacer:
 
         print(f"  [CD] final={best_cost:.4f} ({oracle_calls} oracle calls, {pass_num} passes)")
         result = torch.tensor(best_pos, dtype=torch.float32)
-        # Skip final legalization if best_pos is already evaluator-valid (all overlaps < 4nm
-        # threshold). The final legalization would resolve these micro-overlaps but at the
-        # cost of moving macros away from their oracle-verified optimal positions.
-        if self._count_hard_overlaps_f32(result, benchmark) > 0:
+        # Skip final legalization if only sub-4nm overlaps remain (TILOS ignores these).
+        # The 5nm-gap legalizer would needlessly push macros away from oracle-optimal positions.
+        if self._count_significant_overlaps(result, benchmark, threshold=0.004) > 0:
             return self._legalize_hard(result, benchmark)
         return result
 
