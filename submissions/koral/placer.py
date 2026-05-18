@@ -407,8 +407,13 @@ class KoralPlacer:
                 "detailed_place_flag":  0,
                 "global_place_flag":  1,
                 "enable_fillers":     1,
-                "stop_overflow":      0.01,   # tight target: forces full iterations even for good CT-init
-                "gp_noise_ratio":     0.01,   # low noise: CT-init already near-optimal, refine don't perturb
+                "stop_overflow":      0.01 if center_init else 0.05,
+                # center-init: tight target forces DREAMPlace to converge fully (ibm01 needs this).
+                # CT-init: relax to 5% — CT positions already ~4% overflow; tight target causes
+                # aggressive density optimization → divergence. 5% keeps DREAMPlace stable.
+                "gp_noise_ratio":     0.025 if center_init else 0.01,
+                # center-init: standard noise helps explore from random scatter.
+                # CT-init: low noise preserves near-optimal starting positions.
                 "random_center_init_flag": 1 if center_init else 0,
                 "ignore_net_degree":  100,
                 "num_threads":        8,
