@@ -384,16 +384,14 @@ class KoralPlacer:
                         _gpu = 1
                 except Exception:
                     pass
-            if center_init:
-                # center-init (ibm01): use original validated iteration counts.
-                # 2000+3000 triggered repeated entropy injection (overflow>95% at start)
-                # causing divergence and local minima. 500+1000 avoids this.
+            if _gpu:
+                # GPU: 500+1000 validated iteration counts. More iterations (2000+3000)
+                # cause DREAMPlace to aggressively push WL at the cost of macro separation,
+                # resulting in 140-200 hard macro overlaps that legalization can't fix.
+                # 500+1000 gives good WL improvement with manageable overlap count (0-5).
                 _iters1, _iters2 = 500, 1000
-            elif _gpu:
-                # CT-init on GPU: more iterations for ibm02+ since CT is near-optimal.
-                _iters1, _iters2 = 2000, 3000
             else:
-                # CT-init on CPU: limit to avoid timeout.
+                # CPU: limit to avoid timeout.
                 _iters1, _iters2 = 200, 300
 
             # Build DREAMPlace params
