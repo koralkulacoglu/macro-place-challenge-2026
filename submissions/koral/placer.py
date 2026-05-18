@@ -408,13 +408,13 @@ class KoralPlacer:
                 "detailed_place_flag":  0,
                 "global_place_flag":  1,
                 "enable_fillers":     1,
-                "stop_overflow":      0.01 if center_init else 0.03,
-                # center-init: tight target forces DREAMPlace to converge fully (ibm01 needs this).
-                # CT-init: relax to 3% — CT positions start at ~4% overflow; a tight 1% target causes
-                # aggressive density optimization that diverges. 3% gives DREAMPlace useful WL
-                # optimization while being close enough to CT density to stay stable.
-                "gp_noise_ratio":     0.01,
-                # Low noise for both modes: 2.5% noise for center-init caused WL divergence.
+                "stop_overflow":      0.07 if center_init else 0.03,
+                # center-init: 7% is the original working value. 1% was too tight — DREAMPlace
+                # kept pushing past the stable spread zone, triggering the divergence rollback
+                # at 4% overflow (rollback window = 1.1x–4x stop_overflow). At 7% target,
+                # DREAMPlace converges naturally with few macro overlaps.
+                # CT-init: 3% — CT positions start at ~4% overflow; DREAMPlace refines slightly.
+                "gp_noise_ratio":     0.025 if center_init else 0.01,
                 "random_center_init_flag": 1 if center_init else 0,
                 "ignore_net_degree":  100,
                 "num_threads":        8,
@@ -423,7 +423,7 @@ class KoralPlacer:
                 "result_dir":         os.path.join(tmpdir, "results"),
                 "global_place_stages": [
                     {
-                        "num_bins_x": 64, "num_bins_y": 64,
+                        "num_bins_x": 128, "num_bins_y": 128,  # coarse first
                         "iteration": _iters1, "learning_rate": 0.01,
                         "wirelength": "weighted_average",
                         "optimizer": "nesterov",
@@ -431,7 +431,7 @@ class KoralPlacer:
                         "Lsub_iteration": 1,
                     },
                     {
-                        "num_bins_x": 256, "num_bins_y": 256,
+                        "num_bins_x": 512, "num_bins_y": 512,  # fine second
                         "iteration": _iters2, "learning_rate": 0.01,
                         "wirelength": "weighted_average",
                         "optimizer": "nesterov",
@@ -439,7 +439,7 @@ class KoralPlacer:
                         "Lsub_iteration": 1,
                     },
                 ],
-                "macro_halo_x": 50,   # 50nm gap → prevents float-precision boundary overlaps
+                "macro_halo_x": 50,
                 "macro_halo_y": 50,
                 "plot_flag":    0,
                 "dtype":        "float32",
