@@ -350,12 +350,25 @@ class KoralPlacer:
         try:
             import os, sys, pathlib
             _nlp_src = pathlib.Path('/opt/dreamplace/dreamplace/NonLinearPlace.py')
-            if _nlp_src.exists() and '# koral: lgamma_div_disabled' not in _nlp_src.read_text():
+            if _nlp_src.exists() and '# koral: all_disabled' not in _nlp_src.read_text():
                 _src = _nlp_src.read_text()
-                # Remove the hpwl>2×best divergence check (keep only the overflow>prev check)
+                # 1. Remove hpwl>2×best divergence early-stop (WL spikes during center-init
+                #    spreading cause false positives that abort optimization after ~50 steps)
                 _src = _src.replace(
                     'and cur_metric.hpwl > best_metric[0].hpwl * 2',
-                    'and False  # koral: lgamma_div_disabled (center-init WL spikes falsely trigger)'
+                    'and False  # koral: lgamma_div_disabled'
+                )
+                # 2. Disable entropy injection (overflow>0.95 branch that adds large Gaussian
+                #    noise and scrambles macros; makes center-init stochastic and unreliable)
+                _src = _src.replace(
+                    'if overflow_list[-1] > 0.95:  # stuck at very high overflow',
+                    'if False:  # koral: entropy_injection_disabled'
+                )
+                # Mark file as patched
+                _src = _src.replace(
+                    '# koral: lgamma_div_disabled',
+                    '# koral: lgamma_div_disabled  # koral: all_disabled',
+                    1  # only first occurrence
                 )
                 _nlp_src.write_text(_src)
                 # Clear bytecache so Python reloads from source
@@ -366,7 +379,7 @@ class KoralPlacer:
                 for _k in [k for k in sys.modules if 'NonLinearPlace' in k]:
                     del sys.modules[_k]
                 import NonLinearPlace  # noqa: F811
-                print("  [patch] NonLinearPlace Lgamma divergence stop disabled")
+                print("  [patch] NonLinearPlace: Lgamma div-stop + entropy injection disabled")
         except Exception as _e:
             print(f"  [patch] NonLinearPlace patch failed: {_e}")
 
