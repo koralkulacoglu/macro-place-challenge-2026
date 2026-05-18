@@ -630,7 +630,12 @@ class KoralPlacer:
                 elapsed = time.time() - t0
                 if proc.returncode != 0:
                     print(f"  [Xplace] failed (rc={proc.returncode}) in {elapsed:.0f}s")
-                    print(f"  [Xplace] stderr: {proc.stderr[-500:]}")
+                    out_tail = (proc.stdout or "")[-800:]
+                    err_tail = (proc.stderr or "")[-400:]
+                    if out_tail:
+                        print(f"  [Xplace] stdout tail: {out_tail}")
+                    if err_tail:
+                        print(f"  [Xplace] stderr: {err_tail}")
                     return None
                 print(f"  [Xplace] completed in {elapsed:.0f}s")
             except subprocess.TimeoutExpired:
