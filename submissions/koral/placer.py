@@ -209,34 +209,48 @@ class KoralPlacer:
         n_mv_hard = sum(1 for i in range(benchmark.num_hard_macros)
                         if not benchmark.macro_fixed[i])
 
-        # Skip DREAMPlace if SA budget is too short (DREAMPlace would eat all the time).
-        # CPU DREAMPlace: ~2-3 min. Only worth running if SA gets meaningful time after.
-        if _dreamplace_available() and self.sa_time_budget >= 300:
-            # CT-init (warm start): better for large benchmarks (ibm02-18) where center-init diverges.
-            # Center-init (random scatter): historically best for ibm01 (finds 0.9221 vs CT 1.04).
-            # Strategy: always try CT-init; also try center-init for small benchmarks (≤260 macros).
+        # Try analytical placers: Xplace (preferred) → DREAMPlace → CT fallback.
+        # Xplace: routability-aware GP, directly targets congestion. Requires CUDA.
+        # DREAMPlace: WL+density GP, entropy injection patched at runtime. CPU/GPU.
+        if self.sa_time_budget >= 300:
             ct_cost = compute_proxy_cost(ct_legal, benchmark, plc)["proxy_cost"] if plc else float('inf')
-            best_dp_cost = ct_cost
+            best_ap_cost = ct_cost
             best_placement = ct_legal
-            _n_mv_dp = sum(1 for i in range(benchmark.num_hard_macros) if not benchmark.macro_fixed[i])
 
-            # Single-seed center-init DREAMPlace. Stochastic (gp_noise_ratio=0.025) —
-            # sometimes beats CT significantly (1.01 vs 1.04 for ibm01), sometimes not.
-            # If result has overlaps after legalization or is worse than CT, auto-discarded.
+            # ── Try Xplace (routability-driven GP) ───────────────────────────
             try:
-                dp = self._run_dreamplace(benchmark, center_init=True,
-                                          fix_soft=False, dp_seed=self.seed)
-                dp = self._legalize_hard(dp, benchmark)
-                if self._count_hard_overlaps_f32(dp, benchmark) == 0 and plc is not None:
-                    dp_cost = compute_proxy_cost(dp, benchmark, plc)["proxy_cost"]
-                    if dp_cost < best_dp_cost:
-                        print(f"  [start] DREAMPlace(center-init) {dp_cost:.4f} < best {best_dp_cost:.4f}")
-                        best_dp_cost = dp_cost
-                        best_placement = dp
+                xpl = self._run_xplace(benchmark)
+                if xpl is not None:
+                    xpl = self._legalize_hard(xpl, benchmark)
+                    if self._count_hard_overlaps_f32(xpl, benchmark) == 0 and plc is not None:
+                        xpl_cost = compute_proxy_cost(xpl, benchmark, plc)["proxy_cost"]
+                        if xpl_cost < best_ap_cost:
+                            print(f"  [start] Xplace {xpl_cost:.4f} < best {best_ap_cost:.4f} ✓")
+                            best_ap_cost = xpl_cost
+                            best_placement = xpl
+                        else:
+                            print(f"  [start] Xplace {xpl_cost:.4f} >= CT {best_ap_cost:.4f}")
                     else:
-                        print(f"  [start] DREAMPlace(center-init) {dp_cost:.4f} >= best {best_dp_cost:.4f}")
+                        print(f"  [start] Xplace: overlaps after legalize, discarded")
             except Exception as e:
-                print(f"  [start] DREAMPlace(center-init) failed: {e}")
+                print(f"  [start] Xplace failed: {e}")
+
+            # ── Try DREAMPlace (WL+density GP) as fallback/complement ────────
+            if _dreamplace_available():
+                try:
+                    dp = self._run_dreamplace(benchmark, center_init=True,
+                                              fix_soft=False, dp_seed=self.seed)
+                    dp = self._legalize_hard(dp, benchmark)
+                    if self._count_hard_overlaps_f32(dp, benchmark) == 0 and plc is not None:
+                        dp_cost = compute_proxy_cost(dp, benchmark, plc)["proxy_cost"]
+                        if dp_cost < best_ap_cost:
+                            print(f"  [start] DREAMPlace(center-init) {dp_cost:.4f} < best {best_ap_cost:.4f} ✓")
+                            best_ap_cost = dp_cost
+                            best_placement = dp
+                        else:
+                            print(f"  [start] DREAMPlace(center-init) {dp_cost:.4f} >= best {best_ap_cost:.4f}")
+                except Exception as e:
+                    print(f"  [start] DREAMPlace(center-init) failed: {e}")
 
             placement = best_placement
 
@@ -525,6 +539,161 @@ class KoralPlacer:
         # leaves many small overlaps that a single 2000-pass outer legalization may not resolve).
         placement = self._legalize_hard(placement, benchmark)
         return placement
+
+    def _run_xplace(self, benchmark: Benchmark) -> torch.Tensor:
+        """
+        Run Xplace global placement and return macro positions [num_macros, 2].
+
+        Xplace supports routability-driven placement (unlike DREAMPlace), directly
+        optimizing the congestion component of the proxy cost via routing forces.
+
+        Requires XPLACE_HOME env var and CUDA. Returns None on failure.
+        """
+        import subprocess, os, sys
+
+        xplace_home = os.environ.get('XPLACE_HOME', '/opt/xplace')
+        xplace_main = os.path.join(xplace_home, 'main.py')
+        if not os.path.exists(xplace_main):
+            print(f"  [Xplace] not found at {xplace_main}")
+            return None
+
+        if not torch.cuda.is_available():
+            print("  [Xplace] requires CUDA, skipping")
+            return None
+
+        # Compute target density from benchmark utilization
+        macro_area = (benchmark.macro_sizes[:, 0] * benchmark.macro_sizes[:, 1]).sum().item()
+        canvas_area = benchmark.canvas_width * benchmark.canvas_height
+        utilization = macro_area / canvas_area
+        target_density = min(0.95, utilization + 0.15)
+
+        with tempfile.TemporaryDirectory(prefix=f"koral_{benchmark.name}_xpl_") as tmpdir:
+            # Write bookshelf input (same format as DREAMPlace, reuse existing function)
+            aux_path = write_bookshelf(benchmark, tmpdir, fix_soft=False)
+
+            result_dir = os.path.join(tmpdir, "results")
+            exp_id = "xpl"
+            output_dir = "out"
+            output_prefix = "placement"
+            os.makedirs(os.path.join(result_dir, exp_id, output_dir), exist_ok=True)
+
+            custom_path = (
+                f"aux:{aux_path},"
+                f"benchmark:ispd2005,"
+                f"design_name:{benchmark.name}"
+            )
+
+            cmd = [
+                sys.executable, xplace_main,
+                "--custom_path",          custom_path,
+                "--load_from_raw",        "True",
+                "--global_placement",     "True",
+                "--legalization",         "False",
+                "--detail_placement",     "False",
+                "--write_placement",      "True",
+                "--write_global_placement","True",
+                "--inner_iter",           "5000",
+                "--use_filler",           "False",
+                "--noise_ratio",          "0.025",
+                "--target_density",       str(target_density),
+                "--stop_overflow",        "0.05",
+                "--mixed_size",           "True",
+                "--gpu",                  "0",
+                "--num_threads",          "8",
+                "--seed",                 str(self.seed),
+                "--deterministic",        "True",
+                # Routability force: helps reduce congestion directly
+                "--use_route_force",      "False",   # enable if needed
+                "--result_dir",           result_dir,
+                "--exp_id",               exp_id,
+                "--output_dir",           output_dir,
+                "--output_prefix",        output_prefix,
+                "--log_name",             "xplace.log",
+                "--verbose_cpp_log",      "False",
+                "--cpp_log_level",        "2",
+            ]
+
+            print(f"  [Xplace] running GP on {benchmark.name}...")
+            t0 = time.time()
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=600,
+                    env={**os.environ, "PYTHONPATH": f"{xplace_home}:{os.environ.get('PYTHONPATH', '')}"}
+                )
+                elapsed = time.time() - t0
+                if proc.returncode != 0:
+                    print(f"  [Xplace] failed (rc={proc.returncode}) in {elapsed:.0f}s")
+                    print(f"  [Xplace] stderr: {proc.stderr[-500:]}")
+                    return None
+                print(f"  [Xplace] completed in {elapsed:.0f}s")
+            except subprocess.TimeoutExpired:
+                print("  [Xplace] timed out")
+                return None
+            except Exception as e:
+                print(f"  [Xplace] error: {e}")
+                return None
+
+            # Find output .pl file
+            pl_path = os.path.join(result_dir, exp_id, output_dir,
+                                   f"{output_prefix}_{benchmark.name}_gp.pl")
+            if not os.path.exists(pl_path):
+                # Try alternate naming (Xplace uses exp_id with timestamp sometimes)
+                import glob
+                candidates = glob.glob(os.path.join(result_dir, "**", "*_gp.pl"), recursive=True)
+                if candidates:
+                    pl_path = candidates[0]
+                    print(f"  [Xplace] found pl at: {pl_path}")
+                else:
+                    print(f"  [Xplace] output .pl not found at {pl_path}")
+                    return None
+
+            # Parse Bookshelf .pl file → positions tensor
+            # Format: "n{idx} x_nm y_nm : N" (lower-left coords in nm)
+            positions = benchmark.macro_positions.clone().float()
+            macro_sizes = benchmark.macro_sizes.float()
+            parsed = 0
+            try:
+                with open(pl_path) as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) < 3:
+                            continue
+                        name = parts[0]
+                        if not name.startswith('n'):
+                            continue
+                        idx_str = name[1:]
+                        if not idx_str.isdigit():
+                            continue
+                        idx = int(idx_str)
+                        if idx >= benchmark.num_macros:
+                            continue
+                        if benchmark.macro_fixed[idx]:
+                            continue
+                        try:
+                            xl_nm = float(parts[1])
+                            yl_nm = float(parts[2])
+                        except ValueError:
+                            continue
+                        # Convert lower-left nm → center μm
+                        w, h = float(macro_sizes[idx, 0]), float(macro_sizes[idx, 1])
+                        cx = xl_nm / 1000.0 + w / 2.0
+                        cy = yl_nm / 1000.0 + h / 2.0
+                        # Clamp to canvas
+                        cx = max(w/2, min(benchmark.canvas_width  - w/2, cx))
+                        cy = max(h/2, min(benchmark.canvas_height - h/2, cy))
+                        positions[idx, 0] = cx
+                        positions[idx, 1] = cy
+                        parsed += 1
+            except Exception as e:
+                print(f"  [Xplace] pl parse error: {e}")
+                return None
+
+            print(f"  [Xplace] parsed {parsed} macro positions")
+            if parsed < benchmark.num_hard_macros // 2:
+                print(f"  [Xplace] too few positions parsed, discarding")
+                return None
+
+            return positions
 
     # ── Post-DREAMPlace legalization ──────────────────────────────────────────
 

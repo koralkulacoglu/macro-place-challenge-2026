@@ -62,6 +62,29 @@ RUN cd /tmp/dreamplace_src \
 # DREAMPlace at /opt so bind-mounts on /challenge don't shadow it
 ENV PYTHONPATH=/opt/dreamplace:/opt/dreamplace/dreamplace
 
+# ── Xplace: routability-driven analytical placer (rank-1 team uses this) ──
+# Xplace supports ISPD2005 Bookshelf format (same as DREAMPlace), adds
+# routing congestion force that DREAMPlace lacks. Requires CUDA at runtime.
+RUN git clone --depth=1 --recurse-submodules \
+        https://github.com/cuhk-eda/Xplace.git /tmp/xplace_src \
+    && cd /tmp/xplace_src \
+    && pip install --no-cache-dir pandas loguru \
+    && mkdir build && cd build \
+    && cmake .. \
+        -DCMAKE_INSTALL_PREFIX=/opt/xplace \
+        -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DPYTHON_EXECUTABLE=$(which python3) \
+    && make -j$(nproc) \
+    && make install \
+    && cp -r /tmp/xplace_src/src /opt/xplace/src \
+    && cp -r /tmp/xplace_src/utils /opt/xplace/utils \
+    && cp /tmp/xplace_src/main.py /opt/xplace/main.py \
+    && rm -rf /tmp/xplace_src
+
+ENV XPLACE_HOME=/opt/xplace
+ENV PYTHONPATH=/opt/xplace:/opt/dreamplace:/opt/dreamplace/dreamplace
+
 # Benchmarks (baked in for self-contained image; judges mount their own)
 COPY external/MacroPlacement/Testcases/ICCAD04 /challenge/external/MacroPlacement/Testcases/ICCAD04
 COPY external/MacroPlacement/CodeElements/Plc_client /challenge/external/MacroPlacement/CodeElements/Plc_client
@@ -70,5 +93,6 @@ COPY external/MacroPlacement/CodeElements/Plc_client /challenge/external/MacroPl
 RUN mkdir -p /challenge/submissions/koral
 COPY submissions/koral/placer.py    /challenge/submissions/koral/placer.py
 COPY submissions/koral/bookshelf.py /challenge/submissions/koral/bookshelf.py
+COPY submissions/koral/fast_eval.py /challenge/submissions/koral/fast_eval.py
 
 ENTRYPOINT ["python", "-m", "macro_place.evaluate"]
