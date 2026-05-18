@@ -452,6 +452,24 @@ class KoralPlacer:
 
             params = Params.Params(); params.load(params_path)
             placedb = PlaceDB.PlaceDB(); placedb(params)
+
+            # Compatibility fix: newer DREAMPlace may call quad_penalty_coeff before it's
+            # initialized when quad_penalty is set to True after a divergence rollback.
+            # Patching PlaceObj.__init__ to default quad_penalty_coeff=0.0 (safe: 0=no quadratic
+            # penalty) prevents AttributeError; proper value is set on first __call__().
+            try:
+                import dreamplace.PlaceObj as _po
+                if not getattr(_po.PlaceObj, '_koral_qpc_patched', False):
+                    _orig_po_init = _po.PlaceObj.__init__
+                    def _po_init_patched(self, *a, **kw):
+                        _orig_po_init(self, *a, **kw)
+                        if not hasattr(self, 'quad_penalty_coeff'):
+                            self.quad_penalty_coeff = 0.0
+                    _po.PlaceObj.__init__ = _po_init_patched
+                    _po.PlaceObj._koral_qpc_patched = True
+            except Exception:
+                pass
+
             placer = NonLinearPlace.NonLinearPlace(params, placedb, timer=None)
             placer(params, placedb, learning_rate_value=None)
 
