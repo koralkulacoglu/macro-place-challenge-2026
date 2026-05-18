@@ -408,11 +408,11 @@ class KoralPlacer:
                 "detailed_place_flag":  0,
                 "global_place_flag":  1,
                 "enable_fillers":     1,
-                "stop_overflow":      0.07 if center_init else 0.03,
-                # center-init: 7% is the original working value. 1% was too tight — DREAMPlace
-                # kept pushing past the stable spread zone, triggering the divergence rollback
-                # at 4% overflow (rollback window = 1.1x–4x stop_overflow). At 7% target,
-                # DREAMPlace converges naturally with few macro overlaps.
+                "stop_overflow":      0.001 if center_init else 0.03,
+                # center-init: 0.001 keeps rollback window at [0.11%, 0.4%] which center-init
+                # never reaches, effectively disabling the divergence rollback. DREAMPlace runs
+                # all iterations without early stopping. 0.07 and 0.01 both triggered rollback
+                # at different overflow ranges (7-28% and 1-4% respectively).
                 # CT-init: 3% — CT positions start at ~4% overflow; DREAMPlace refines slightly.
                 "gp_noise_ratio":     0.025 if center_init else 0.01,
                 "random_center_init_flag": 1 if center_init else 0,
