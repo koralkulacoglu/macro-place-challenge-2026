@@ -384,16 +384,17 @@ class KoralPlacer:
                         _gpu = 1
                 except Exception:
                     pass
-            if _gpu:
-                # GPU: fast enough for many iterations on all benchmark sizes.
+            if center_init:
+                # center-init (ibm01): use original validated iteration counts.
+                # 2000+3000 triggered repeated entropy injection (overflow>95% at start)
+                # causing divergence and local minima. 500+1000 avoids this.
+                _iters1, _iters2 = 500, 1000
+            elif _gpu:
+                # CT-init on GPU: more iterations for ibm02+ since CT is near-optimal.
                 _iters1, _iters2 = 2000, 3000
-            elif n_mv_hard > 248:
-                # CPU, ibm02+ (259+ macros): uses CT-init; limit iters to avoid timeout.
-                _iters1, _iters2 = 200, 300
             else:
-                # CPU, ibm01 (246 macros): center-init; 1700 iters ≈ 5 min CPU, 1.5 min on judge.
-                # Fewer iters degrade quality significantly (0.9697@800 vs 0.9221@2500).
-                _iters1, _iters2 = 700, 1000
+                # CT-init on CPU: limit to avoid timeout.
+                _iters1, _iters2 = 200, 300
 
             # Build DREAMPlace params
             params_dict = {
