@@ -120,36 +120,36 @@ If you have non-standard deps, include a `Dockerfile` in your submission. Otherw
 
 ## Our Submission: `submissions/koral/`
 
-GPU-accelerated analytical placement via **DREAMPlace** (BSD-3, UT Austin) + oracle SA. See `HANDOFF.md` for the full strategic context.
+CT positions + parallel SA + ibm06 cascade fix. DREAMPlace is included but broken in the current Docker image — see HANDOFF.md for full details.
 
-**Pipeline (current code, all changes unverified on a full run):**
-1. CT positions → `_legalize_hard` → initial proxy eval
-2. DREAMPlace center-init (if available in Docker). Beats CT for ibm01 only; all ibm02-18 diverge 4-8×.
-3. `_cd_lns_polish` (600s budget):
-   - CD (delta-HPWL, oracle/pass, exits after 5 non-improving passes)
-   - LNS (pairwise swaps, adaptive time cap: 15–50% of budget based on WL fraction)
-   - FD gradient descent (finite-difference proxy gradient for top-20 congested macros)
-   - Oracle SA (remaining time, k=1 single-macro, congestion-guided, SA temperature)
-   - Soft macro position update (revert if no gain)
-   - Skip final legalization if zero f32-detectable overlaps
+**Pipeline (git: 5a31474, full run in progress):**
+1. CT positions → legalize → proxy eval (baseline ~1.04–1.57 per benchmark)
+2. DREAMPlace center-init (stochastic; ~25% chance of beating CT; auto-discarded if worse)
+3. Best of (CT, DREAMPlace) → 4 parallel SA workers (seeds 42–45)
+   - Perturbation: 0%, 1.5%, 3%, 4.5% Gaussian noise (σ = fraction of canvas)
+4. `_cd_lns_polish` (3480s budget per worker):
+   - CD → LNS → FD → hSA (65% translate, 15% rotate, 20% swap)
+   - Oracle SA tail: 70% translate, 30% swap (NEW: swap moves added May 18)
+5. Best worker result used as final placement
 
-**Key empirical findings:**
-- DREAMPlace only beats CT for ibm01 (center=0.9221 vs CT=1.04); ibm02-18 diverge (4-8×)
-- k_osa_max=1 is critical — k=6 cluster moves have ~5% valid rate on ibm02-range → kills throughput
-- Oracle SA improves ibm02: 1.5646→1.5476 with k=1; finds 0 improvements for ibm09 (CT optimal)
-- LNS consistently finds 0.001–0.003 improvements for WL-dominated benchmarks
-- ibm06: CT positions have 52 sub-4nm overlaps (TILOS-valid), legalization costs +0.27 proxy
-- FD gradient works for WL-dominated (ibm02, ibm04) but not congestion-dominated (ibm06)
-- Adaptive LNS cap (15% for ibm06) gives oracle SA 460s instead of 30s
+**Key empirical findings (verified May 2026):**
+- DREAMPlace (current Docker, May 2026 version): unreliable. center-init gives 1.01–1.23 (vs CT 1.04) stochastically. CT-init creates 139-200 hard macro overlaps → always discarded. OLD DREAMPlace gave ibm01=0.9197 reliably. FIX: pin Docker to pre-entropy-injection commit.
+- ibm06: CT has 47 sub-4nm overlaps → cascade in micro_legalize. Perturbed workers at 3-4.5% sigma escape → 1.6877 (was 1.8343). This is the biggest SA improvement.
+- Swap moves (30% in oracle SA): just added, unverified improvement. Should help WL-dominated.
+- k_osa_max=1 is critical — cluster moves have <5% validity rate on dense benchmarks.
+- LNS: 0.001–0.003 improvement for WL-dominated benchmarks.
 
-**Best verified scores:**
-ibm01=0.9221 (DREAMPlace), ibm02=1.5476 (oracle SA k=1), ibm03=1.3244, ibm04=1.3104,
-ibm06=1.9249 (legalization damage from sub-threshold CT overlaps), ibm07=1.4650, ibm09=1.1126
-ibm10–18: never run with current code.
+**Best verified scores (May 2026):**
+- ibm01: 0.9197 (old DREAMPlace, first session) / ~1.03 (current, CT+SA)
+- ibm02: 1.5476 (CT+SA)
+- ibm06: 1.6877 (perturbed SA cascade escape)
+- ibm09: 1.1126
+- Average (all 17, old baseline): 1.457
+- Average (estimated, current): ~1.42–1.45
 
-**Leaderboard position (estimated):** ~rank 35–45, avg ~1.45–1.55. Target: top 5 (need ~1.04).
-Top teams ALL use analytical placement (DREAMPlace/Xplace) as global init for every benchmark.
-Highest-leverage improvement: CT-init DREAMPlace for ibm02-18 (see HANDOFF.md §Strategy §1).
+**Leaderboard position (estimated):** ~rank 30–40. Target: top 5 (need ~1.04).
+**Critical gap:** analytical placement. Fix DREAMPlace version OR integrate Xplace.
+See HANDOFF.md for all next steps.
 
 **Key files:**
 - `submissions/koral/placer.py` — `KoralPlacer` class (~1291 lines)
