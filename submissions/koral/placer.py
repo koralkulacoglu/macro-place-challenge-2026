@@ -453,19 +453,19 @@ class KoralPlacer:
             params = Params.Params(); params.load(params_path)
             placedb = PlaceDB.PlaceDB(); placedb(params)
 
-            # Compatibility fix: newer DREAMPlace may call quad_penalty_coeff before it's
-            # initialized when quad_penalty is set to True after a divergence rollback.
-            # Patching PlaceObj.__init__ to default quad_penalty_coeff=0.0 (safe: 0=no quadratic
-            # penalty) prevents AttributeError; proper value is set on first __call__().
+            # Compatibility fix: newer DREAMPlace sets quad_penalty=True after a divergence
+            # rollback on a PlaceObj that was initialized with quad_penalty=False (and thus
+            # never had quad_penalty_coeff set). Patch PlaceObj.__call__ (NOT __init__)
+            # so the fix applies to EXISTING instances created inside NonLinearPlace.__init__.
             try:
                 import dreamplace.PlaceObj as _po
                 if not getattr(_po.PlaceObj, '_koral_qpc_patched', False):
-                    _orig_po_init = _po.PlaceObj.__init__
-                    def _po_init_patched(self, *a, **kw):
-                        _orig_po_init(self, *a, **kw)
-                        if not hasattr(self, 'quad_penalty_coeff'):
-                            self.quad_penalty_coeff = 0.0
-                    _po.PlaceObj.__init__ = _po_init_patched
+                    _orig_po_call = _po.PlaceObj.__call__
+                    def _patched_po_call(self, pos):
+                        if not hasattr(self, 'quad_penalty_coeff') and getattr(self, 'quad_penalty', False):
+                            self.quad_penalty_coeff = 0.0  # safe default: disables quadratic penalty
+                        return _orig_po_call(self, pos)
+                    _po.PlaceObj.__call__ = _patched_po_call
                     _po.PlaceObj._koral_qpc_patched = True
             except Exception:
                 pass
