@@ -350,8 +350,9 @@ class KoralPlacer:
             macro_area = (benchmark.macro_sizes[:, 0] * benchmark.macro_sizes[:, 1]).sum().item()
             canvas_area = benchmark.canvas_width * benchmark.canvas_height
             utilization = macro_area / canvas_area
-            # Add headroom — too tight causes legalization failure
-            target_density = min(0.95, utilization + 0.2)
+            # Headroom: center-init starts from scatter → needs 20% headroom to allow spreading.
+            # CT-init starts near-optimal → 5% headroom prevents over-constraining the layout.
+            target_density = min(0.95, utilization + (0.20 if center_init else 0.05))
 
         with tempfile.TemporaryDirectory(prefix=f"koral_{benchmark.name}_") as tmpdir:
             movable_hard = [i for i in range(benchmark.num_hard_macros)
