@@ -1727,13 +1727,30 @@ class KoralPlacer:
             _ils_scale = max(cw, ch) * 0.10
             _ils_count = 0; _ils_ok_count = 0
             print(f"  [ILS] {_osa_remain:.0f}s, ~{_osa_remain/_ils_budget_s:.0f} restarts planned")
+            # Identify boundary-adjacent macros: cascade failures in ibm06 are caused by
+            # macros at canvas edges creating stuck fixed-macro overlap pairs.
+            _bdy_thresh = max(cw, ch) * 0.05
+            _bdy_macros = [i for i in movable_hard
+                           if (pos[i,0]-hw[i] < _bdy_thresh or cw-pos[i,0]-hw[i] < _bdy_thresh
+                               or pos[i,1]-hh[i] < _bdy_thresh or ch-pos[i,1]-hh[i] < _bdy_thresh)]
             while time.time() < deadline - oracle_time_est * 8:
                 _ils_count += 1
                 _prt = best_pos.copy()
                 _n_p = max(1, n_mv // 12)
-                for _pm in random.sample(movable_hard, min(_n_p, n_mv)):
-                    _prt[_pm, 0] = float(np.clip(_prt[_pm, 0] + random.gauss(0, _ils_scale), hw[_pm], cw - hw[_pm]))
-                    _prt[_pm, 1] = float(np.clip(_prt[_pm, 1] + random.gauss(0, _ils_scale), hh[_pm], ch - hh[_pm]))
+                # Alternate: half the restarts target boundary macros (push inward),
+                # half use random perturbation to diversify exploration.
+                if _bdy_macros and _ils_count % 2 == 0:
+                    _targets = random.sample(_bdy_macros, min(max(1, len(_bdy_macros)//2), _n_p))
+                    for _pm in _targets:
+                        _dx = cw/2 - _prt[_pm, 0]; _dy = ch/2 - _prt[_pm, 1]
+                        _d = math.sqrt(_dx*_dx + _dy*_dy)
+                        if _d > 0:
+                            _prt[_pm, 0] = float(np.clip(_prt[_pm,0]+_dx/_d*_ils_scale, hw[_pm], cw-hw[_pm]))
+                            _prt[_pm, 1] = float(np.clip(_prt[_pm,1]+_dy/_d*_ils_scale, hh[_pm], ch-hh[_pm]))
+                else:
+                    for _pm in random.sample(movable_hard, min(_n_p, n_mv)):
+                        _prt[_pm, 0] = float(np.clip(_prt[_pm, 0] + random.gauss(0, _ils_scale), hw[_pm], cw - hw[_pm]))
+                        _prt[_pm, 1] = float(np.clip(_prt[_pm, 1] + random.gauss(0, _ils_scale), hh[_pm], ch - hh[_pm]))
                 _rebuild_state(_prt, best_ori)
                 _r_dead = min(deadline - oracle_time_est * 5, time.time() + _ils_budget_s)
                 _r_best = float('inf'); _r_pos = _prt.copy()
