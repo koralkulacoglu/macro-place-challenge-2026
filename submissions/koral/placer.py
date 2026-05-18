@@ -1553,8 +1553,8 @@ class KoralPlacer:
         if _osa_remain > oracle_time_est * 5 and _osa_micro_ok:
             _pre_osa_best_pos = best_pos.copy(); _pre_osa_best_cost = best_cost  # save for revert
             _rebuild_state(best_pos, best_ori)
-            _osa_scale = max(cw, ch) * 0.04   # 4% canvas width
-            _osa_T = best_cost * 0.005         # ~0.5% temperature for slight acceptance
+            _osa_scale = max(cw, ch) * 0.04   # 4% canvas width; helps move boundary-stuck macros
+            _osa_T = best_cost * 0.010         # 1% temperature: accepts ≤1% worse moves for exploration
             _osa_improved = 0; _osa_accepted = 0; _osa_tries = 0
             print(f"  [oSA] {_osa_remain:.0f}s remaining, starting oracle SA tail")
             while time.time() < deadline - oracle_time_est * 3:
