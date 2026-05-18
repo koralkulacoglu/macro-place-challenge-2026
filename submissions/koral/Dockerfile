@@ -83,7 +83,16 @@ RUN git clone --depth=1 --recurse-submodules \
     && cp -r /tmp/xplace_src/src /opt/xplace/src \
     && cp -r /tmp/xplace_src/utils /opt/xplace/utils \
     && cp /tmp/xplace_src/main.py /opt/xplace/main.py \
+    && cp -r /tmp/xplace_src/cpp_to_py /opt/xplace/cpp_to_py \
+    && mkdir -p /opt/xplace/thirdparty/flute \
+    && cp /tmp/xplace_src/thirdparty/flute/POWV9.dat /opt/xplace/thirdparty/flute/ \
+    && cp /tmp/xplace_src/thirdparty/flute/POST9.dat /opt/xplace/thirdparty/flute/ \
     && rm -rf /tmp/xplace_src
+
+# Xplace Python runtime deps + NumPy 2.0 compatibility patches
+RUN pip install --no-cache-dir seaborn matplotlib scipy numba torchvision pulp igraph pandas loguru \
+    && sed -i 's/np\.round_/np.round/g' /opt/xplace/src/core/macro_legalization.py \
+    && sed -i 's/dtype=np\.bool8/dtype=np.bool_/g' /opt/xplace/src/core/macro_legalization.py
 
 ENV XPLACE_HOME=/opt/xplace
 ENV PYTHONPATH=/opt/xplace:/opt/dreamplace:/opt/dreamplace/dreamplace
