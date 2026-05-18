@@ -1710,6 +1710,7 @@ class KoralPlacer:
             _osa_mv_arr = np.array(movable_hard, dtype=np.int64)
             _osa_probs = (None if _cong_weights is None
                           else _cong_weights.astype(np.float64) / _cong_weights.sum())
+            _osa_n_mv = len(movable_hard)
             while time.time() < _osa_deadline:
                 # Adaptive scale: decay from base to 25% of base as time runs out
                 _t_frac = min(1.0, (time.time() - _osa_t0) / max(1e-9, _osa_deadline - _osa_t0))
@@ -1718,9 +1719,47 @@ class KoralPlacer:
                     ci = int(np.random.choice(_osa_mv_arr, p=_osa_probs))
                 else:
                     ci = random.choice(movable_hard)
+                _osa_tries += 1
+
+                # 30% swap move: exchange positions of ci and a random second macro.
+                # Swaps explore the solution space far more effectively than translations
+                # for WL-dominated benchmarks — moves a macro directly to where another was.
+                if _osa_n_mv > 1 and random.random() < 0.30:
+                    cj = random.choice(movable_hard)
+                    if cj == ci:
+                        continue
+                    oxi, oyi = float(pos[ci, 0]), float(pos[ci, 1])
+                    oxj, oyj = float(pos[cj, 0]), float(pos[cj, 1])
+                    # Bounds check: ci must fit at cj's pos, cj must fit at ci's pos.
+                    if (oxj - hw[ci] < 0 or oxj + hw[ci] > cw or oyj - hh[ci] < 0 or oyj + hh[ci] > ch
+                            or oxi - hw[cj] < 0 or oxi + hw[cj] > cw or oyi - hh[cj] < 0 or oyi + hh[cj] > ch):
+                        continue
+                    # Move both simultaneously so _overlaps sees the post-swap state.
+                    pos[ci, 0] = oxj; pos[ci, 1] = oyj; all_cx[ci] = oxj; all_cy[ci] = oyj
+                    pos[cj, 0] = oxi; pos[cj, 1] = oyi; all_cx[cj] = oxi; all_cy[cj] = oyi
+                    if _overlaps(ci, oxj, oyj) or _overlaps(cj, oxi, oyi):
+                        pos[ci, 0] = oxi; pos[ci, 1] = oyi; all_cx[ci] = oxi; all_cy[ci] = oyi
+                        pos[cj, 0] = oxj; pos[cj, 1] = oyj; all_cx[cj] = oxj; all_cy[cj] = oyj
+                        continue
+                    cost = compute_proxy_cost(
+                        torch.tensor(pos, dtype=torch.float32), benchmark, plc
+                    )["proxy_cost"]
+                    oracle_calls += 1
+                    delta = cost - best_cost
+                    if delta < 0 or (delta < _osa_T and random.random() < math.exp(-delta / _osa_T)):
+                        _osa_accepted += 1
+                        if cost < best_cost:
+                            best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
+                            _osa_improved += 1
+                            print(f"  [oSA] {cost:.4f}")
+                    else:
+                        pos[ci, 0] = oxi; pos[ci, 1] = oyi; all_cx[ci] = oxi; all_cy[ci] = oyi
+                        pos[cj, 0] = oxj; pos[cj, 1] = oyj; all_cx[cj] = oxj; all_cy[cj] = oyj
+                    continue
+
+                # 70%: Gaussian translation of a single macro
                 cx = float(np.clip(pos[ci, 0] + random.gauss(0, _osa_scale), hw[ci], cw - hw[ci]))
                 cy = float(np.clip(pos[ci, 1] + random.gauss(0, _osa_scale), hh[ci], ch - hh[ci]))
-                _osa_tries += 1
                 if _overlaps(ci, cx, cy):
                     continue
                 old_x, old_y = float(pos[ci, 0]), float(pos[ci, 1])
