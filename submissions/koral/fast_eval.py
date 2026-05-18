@@ -222,6 +222,66 @@ class FastEvaluator:
         top_k = max(1, int(len(combined) * 0.05))
         return torch.topk(combined, top_k).values.mean()
 
+    def congestion_map(self, positions: torch.Tensor) -> np.ndarray:
+        """
+        Return per-bin total routing congestion [R, C] (V+H, normalized).
+        ~3ms. Used by SA to compute congestion gradient for guided moves.
+        """
+        all_pos = self._all_positions(positions)
+        pin_pos = all_pos[self._flat_nodes]
+        x, y    = pin_pos[:, 0], pin_pos[:, 1]
+        nids    = self._net_ids
+        zeros   = torch.zeros(self._num_nets)
+        nx_max  = zeros.clone().scatter_reduce(0, nids, x, reduce='amax', include_self=False)
+        nx_min  = zeros.clone().scatter_reduce(0, nids, x, reduce='amin', include_self=False)
+        ny_max  = zeros.clone().scatter_reduce(0, nids, y, reduce='amax', include_self=False)
+        ny_min  = zeros.clone().scatter_reduce(0, nids, y, reduce='amin', include_self=False)
+        R, C = self._grid_rows, self._grid_cols
+        cw, ch = self._cell_w, self._cell_h
+        c0s = np.clip((nx_min.numpy() / cw).astype(np.int32), 0, C-1)
+        c1s = np.clip((nx_max.numpy() / cw).astype(np.int32), 0, C-1)
+        r0s = np.clip((ny_min.numpy() / ch).astype(np.int32), 0, R-1)
+        r1s = np.clip((ny_max.numpy() / ch).astype(np.int32), 0, R-1)
+        dxs, dys = (nx_max - nx_min).numpy(), (ny_max - ny_min).numpy()
+        ws = self._net_weights.numpy()
+        nc_arr = np.maximum((c1s - c0s + 1).astype(np.float32), 1.0)
+        nr_arr = np.maximum((r1s - r0s + 1).astype(np.float32), 1.0)
+        n_cells = nc_arr * nr_arr
+        v_per = (ws * dys / np.maximum(n_cells * ch, 1e-9)).astype(np.float32)
+        h_per = (ws * dxs / np.maximum(n_cells * cw, 1e-9)).astype(np.float32)
+        V_c = np.zeros((R+1, C+1), dtype=np.float32)
+        H_c = np.zeros((R+1, C+1), dtype=np.float32)
+        for arr, v in [(V_c, v_per), (H_c, h_per)]:
+            np.add.at(arr, (r0s,     c0s),       v)
+            np.add.at(arr, (r1s + 1, c0s),      -v)
+            np.add.at(arr, (r0s,     c1s + 1),  -v)
+            np.add.at(arr, (r1s + 1, c1s + 1),   v)
+        V_cong = np.cumsum(np.cumsum(V_c[:R, :C], axis=0), axis=1)
+        H_cong = np.cumsum(np.cumsum(H_c[:R, :C], axis=0), axis=1)
+        return V_cong / self._v_cap + H_cong / self._h_cap  # [R, C]
+
+    def macro_congestion_score(self, positions: torch.Tensor, n_hard: int) -> np.ndarray:
+        """
+        Per-macro congestion contribution score [n_hard].
+        Score = sum of congestion in bins the macro occupies.
+        ~4ms. Use to select which macros to move for congestion relief.
+        """
+        cmap = self.congestion_map(positions)  # [R, C]
+        scores = np.zeros(n_hard, dtype=np.float32)
+        R, C = self._grid_rows, self._grid_cols
+        cw, ch = self._cell_w, self._cell_h
+        sizes = self._macro_sizes[:n_hard]
+        pos_np = positions[:n_hard].numpy()
+        hw = sizes[:, 0].numpy() / 2
+        hh = sizes[:, 1].numpy() / 2
+        for i in range(n_hard):
+            c0 = max(0, int((pos_np[i, 0] - hw[i]) / cw))
+            c1 = min(C-1, int((pos_np[i, 0] + hw[i]) / cw))
+            r0 = max(0, int((pos_np[i, 1] - hh[i]) / ch))
+            r1 = min(R-1, int((pos_np[i, 1] + hh[i]) / ch))
+            scores[i] = float(cmap[r0:r1+1, c0:c1+1].sum())
+        return scores
+
     def _raw_evaluate(self, positions: torch.Tensor) -> float:
         with torch.no_grad():
             wl   = self._raw_wl(positions)

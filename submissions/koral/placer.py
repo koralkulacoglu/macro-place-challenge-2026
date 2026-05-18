@@ -1969,6 +1969,12 @@ class KoralPlacer:
                             _shared[_nm] = _shared.get(_nm, 0) + 1
                 if _shared:
                     _osa_neighbors[_ci] = [k for k, _ in sorted(_shared.items(), key=lambda x: -x[1])[:5]]
+            # Congestion map for gradient-guided moves (refresh every _cong_refresh_n steps)
+            _cong_map = None
+            _cong_scores = None
+            _cong_refresh_n = 2000  # refresh congestion map every N oSA steps
+            _cong_last_refresh = -_cong_refresh_n  # force refresh on first iteration
+
             while time.time() < _osa_deadline:
                 # Adaptive scale: decay from base to 25% of base as time runs out
                 _t_frac = min(1.0, (time.time() - _osa_t0) / max(1e-9, _osa_deadline - _osa_t0))
@@ -1976,7 +1982,26 @@ class KoralPlacer:
                 # Temperature annealing: hot → cold over oSA budget.
                 # At t=0: T = _osa_T (initial). At t=1: T = 0.01 × _osa_T (near-greedy).
                 _osa_T_cur = _osa_T * max(0.01, 1.0 - 0.99 * _t_frac)
-                if _osa_probs is not None:
+
+                # Refresh congestion map periodically when fast evaluator available.
+                # Used to select macros biased toward congested regions (10% of moves).
+                if _use_fast_osa and (_osa_tries - _cong_last_refresh) >= _cong_refresh_n:
+                    try:
+                        _cong_scores = _fast.macro_congestion_score(
+                            torch.tensor(pos, dtype=torch.float32), n_hard
+                        )
+                        _cong_last_refresh = _osa_tries
+                    except Exception:
+                        _cong_scores = None
+
+                # Move selection: 10% congestion-gradient (pick most-congested movable macro),
+                # else use existing probs or uniform.
+                if (_use_fast_osa and _cong_scores is not None
+                        and random.random() < 0.10 and _osa_n_mv > 0):
+                    # Pick the movable macro with highest congestion contribution
+                    _mv_scores = _cong_scores[_osa_mv_arr]
+                    ci = int(_osa_mv_arr[int(np.argmax(_mv_scores))])
+                elif _osa_probs is not None:
                     ci = int(np.random.choice(_osa_mv_arr, p=_osa_probs))
                 else:
                     ci = random.choice(movable_hard)
