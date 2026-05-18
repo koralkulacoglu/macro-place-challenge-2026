@@ -10,32 +10,27 @@ sed -i \
   "$SRC/cmake/TorchExtension.cmake"
 
 # Patch 2: Disable CUB-based CUDA ops (CUDA 12.4 CUB API incompatible).
-# pin_pos: SURGICAL patch — pin_pos_cuda and pin_pos_cuda_segment share the same
-# if(TORCH_ENABLE_CUDA) block. The cmake uses ${TARGET_NAME}_cuda_segment variables
-# (not literal strings), so block-disable kills both; line-disable misses the header.
-# Solution: multi-line regex wraps ONLY the cuda_segment target in if(FALSE) + removes
-# it from install(), leaving pin_pos_cuda intact and compiled normally for GPU use.
-# k_reorder, global_swap, independent_set_matching: each has own cmake file → block-disable.
-python3 -c "
+# Uses heredoc to avoid bash expanding cmake variable references like TARGET_NAME.
+python3 - "$SRC" << 'PYEOF'
 import re, sys
 
 def disable_pin_pos_segment(cmake_path):
-    '''Surgically disable pin_pos_cuda_segment while keeping pin_pos_cuda enabled.'''
     content = open(cmake_path).read()
-    # Wrap the add_pytorch_extension block for cuda_segment in if(FALSE)
+    # Wrap only the add_pytorch_extension block for cuda_segment in if(FALSE);
+    # pin_pos_cuda (no CUB) stays enabled for GPU global placement.
+    # The cmake file uses ${TARGET_NAME}_cuda_segment variables (not literal strings).
     pattern = r'(add_pytorch_extension\(\$\{TARGET_NAME\}_cuda_segment[^)]*\))'
     replacement = 'if(FALSE)  # koral: disabled (CUDA 12.4 CUB incompatible)\n\\1\nendif()'
     new_content = re.sub(pattern, replacement, content, flags=re.DOTALL)
     if new_content == content:
-        print(f'  WARNING: pattern not found in {cmake_path}')
+        print(f'  WARNING: pin_pos_cuda_segment pattern not found in {cmake_path}')
         return
-    # Remove ${TARGET_NAME}_cuda_segment from install(TARGETS ...)
+    # Remove cuda_segment from install(TARGETS ...) so only pin_pos_cuda is installed
     new_content = re.sub(r'[ \t]*\$\{TARGET_NAME\}_cuda_segment\n?', '', new_content)
     open(cmake_path, 'w').write(new_content)
     print(f'  Disabled pin_pos_cuda_segment in {cmake_path} (pin_pos_cuda kept intact)')
 
 def disable_block(cmake_path, target_name):
-    '''Disable the entire TORCH_ENABLE_CUDA block containing target_name.'''
     content = open(cmake_path).read()
     blocks = re.split(r'(?=if\s*\((?:TORCH_ENABLE_CUDA|torch_enable_cuda)\))', content)
     result = []
@@ -48,30 +43,23 @@ def disable_block(cmake_path, target_name):
     open(cmake_path, 'w').write(''.join(result))
 
 src = sys.argv[1]
-# pin_pos: surgical — keep pin_pos_cuda, disable only pin_pos_cuda_segment (CUB segmented-reduce)
 disable_pin_pos_segment(src + '/dreamplace/ops/pin_pos/CMakeLists.txt')
-# These three each have their own cmake file; safe to block-disable entirely
 disable_block(src + '/dreamplace/ops/k_reorder/CMakeLists.txt', 'k_reorder')
 disable_block(src + '/dreamplace/ops/global_swap/CMakeLists.txt', 'global_swap')
 disable_block(src + '/dreamplace/ops/independent_set_matching/CMakeLists.txt', 'independent_set_matching')
-" "$SRC"
+PYEOF
 
-# Patch 3: NumPy 2.0 compatibility — np.string_ removed, replaced by np.bytes_
-# Fix ALL Python files in DREAMPlace (not just PlaceDB.py)
+# Patch 3: NumPy 2.0 compatibility
 find "$SRC/dreamplace" -name "*.py" -exec sed -i 's/np\.string_/np.bytes_/g' {} \;
 echo "  Fixed np.string_ in all DREAMPlace Python files"
 
-# Patch 4: Soft-import disabled CUDA modules with proper fallbacks.
-# Handles all import patterns (absolute, relative, from-import).
-# Sets module to None on ImportError so callers can do 'if mod is not None: use CUDA'.
-python3 -c "
+# Patch 4: Soft-import fallbacks for disabled CUDA modules
+python3 - "$SRC" << 'PYEOF'
 import re, os, sys
 
 src = sys.argv[1]
-
-# Ops that were disabled at build time → need Python-level None fallback
 disabled_mods = [
-    'pin_pos_cuda_segment',  # disabled in pin_pos
+    'pin_pos_cuda_segment',
     'k_reorder_cuda',
     'global_swap_cuda',
     'independent_set_matching_cuda',
@@ -87,15 +75,12 @@ for op_dir in os.listdir(base):
     for mod in disabled_mods:
         if mod not in content:
             continue
-        # Pattern 1: absolute import
         p1 = r'([ \t]*)(import\s+dreamplace\.ops\.[^\n]*\b' + re.escape(mod) + r'\b[^\n]*\n)'
         r1 = r'\1try:\n\1    \2\1except (ImportError, Exception):\n\1    ' + mod + ' = None\n'
         new = re.sub(p1, r1, content)
-        # Pattern 2: relative from-import
         p2 = r'([ \t]*)(from\s+\.\s+import\s+' + re.escape(mod) + r'\b[^\n]*\n)'
         r2 = r'\1try:\n\1    \2\1except (ImportError, Exception):\n\1    ' + mod + ' = None\n'
         new = re.sub(p2, r2, new)
-        # Pattern 3: from-dotmod import
         p3 = r'([ \t]*)(from\s+\.' + re.escape(mod) + r'\s+import\s+[^\n]*\n)'
         r3 = r'\1try:\n\1    \2\1except (ImportError, Exception):\n\1    pass\n'
         new = re.sub(p3, r3, new)
@@ -105,6 +90,6 @@ for op_dir in os.listdir(base):
             print(f'  Patched import of {mod} in {op_path}')
     if modified:
         open(op_path, 'w').write(content)
-" "$SRC"
+PYEOF
 
 echo "All patches applied successfully."
