@@ -1686,6 +1686,21 @@ class KoralPlacer:
                         _osa_improved += 1
                         _rebuild_fix_bbox_for_nets(macro_to_nets[ci])
                         print(f"  [oSA] {cost:.4f}")
+                        # Refresh congestion weights on improvement to track updated hotspots
+                        if _osa_probs is not None and _cong_weights is not None:
+                            try:
+                                _h2 = np.array(plc.get_horizontal_routing_congestion(), dtype=np.float32)
+                                _v2 = np.array(plc.get_vertical_routing_congestion(), dtype=np.float32)
+                                _mc2 = np.array([(_h2+_v2)[c] if 0<=c<len(_h2) else 0.0
+                                                 for c in [plc.get_grid_cell_of_node(p) for p in _plc_ids]],
+                                                dtype=np.float32)
+                                _thr2 = float(np.percentile(_mc2, 50))
+                                _wts2 = np.maximum(0.0, _mc2 - _thr2).astype(np.float64)
+                                if _wts2.sum() > 0:
+                                    _cong_weights = _wts2 / _wts2.sum()
+                                    _osa_probs = _cong_weights / _cong_weights.sum()
+                            except Exception:
+                                pass
                 else:
                     pos[ci, 0] = old_x; pos[ci, 1] = old_y
                     all_cx[ci] = old_x; all_cy[ci] = old_y
