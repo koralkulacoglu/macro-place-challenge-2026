@@ -264,7 +264,7 @@ class KoralPlacer:
                 for i in range(n_workers):
                     _start = _base_np.copy()
                     if i > 0:
-                        _sigma = max(_cw_f, _ch_f) * (0.04 * i)  # 4%, 8%, 12% for workers 1,2,3
+                        _sigma = max(_cw_f, _ch_f) * (0.015 * i)  # 1.5%, 3%, 4.5% for workers 1,2,3
                         for mi in range(benchmark.num_hard_macros):
                             if _mv_mask[mi]:
                                 _start[mi, 0] = float(np.clip(
