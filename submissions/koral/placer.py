@@ -1466,6 +1466,11 @@ class KoralPlacer:
                     # Reheat on stagnation: if no improvement in _reheat_K oracle calls,
                     # reset temperature to escape local minima.
                     # Last reheat: add perturbation (displace ~5% of macros) for deeper escape.
+                    if (_reheat_count >= _reheat_max and _reheat_no_improve >= _reheat_K
+                            and deadline - time.time() > oracle_time_est * 30):
+                        # All reheats exhausted + stagnating; exit hSA early so oracle SA tail gets time.
+                        # Only exit if >30 oracle calls of time remain (worth running oSA).
+                        break
                     if (_reheat_no_improve >= _reheat_K and _reheat_count < _reheat_max
                             and time.time() < t_hsa_end - oracle_time_est * 20):
                         if _reheat_count < _reheat_max - 1:
@@ -1535,6 +1540,103 @@ class KoralPlacer:
             if hsa_oracle > 0:
                 print(f"  [hSA] {hsa_improved} improved, {hsa_accepted}/{hsa_step} accepted, "
                       f"{hsa_oracle} oracle, swap={'on' if _hsa_swap_enabled else 'off'}")
+
+        # ── Oracle SA tail: direct proxy minimization with remaining time ─────
+        # hSA uses HPWL surrogate which doesn't correlate for congestion-dominated
+        # benchmarks. After hSA stagnates, use oracle (compute_proxy_cost) directly
+        # for single-macro moves. Only helps when micro_legalize will succeed (no
+        # legalize_hard needed): oracle SA can find positions with harder legalization
+        # that look better by proxy but are actually worse after legalize_hard (+0.08 extra).
+        _osa_remain = deadline - time.time() - oracle_time_est * 4
+        _osa_pre_micro = self._micro_legalize(torch.tensor(best_pos, dtype=torch.float32), benchmark)
+        _osa_micro_ok = compute_overlap_metrics(_osa_pre_micro, benchmark)["overlap_count"] == 0
+        if _osa_remain > oracle_time_est * 5 and _osa_micro_ok:
+            _pre_osa_best_pos = best_pos.copy(); _pre_osa_best_cost = best_cost  # save for revert
+            _rebuild_state(best_pos, best_ori)
+            _osa_scale = max(cw, ch) * 0.04   # 4% canvas width
+            _osa_T = best_cost * 0.005         # ~0.5% temperature for slight acceptance
+            _osa_improved = 0; _osa_accepted = 0; _osa_tries = 0
+            print(f"  [oSA] {_osa_remain:.0f}s remaining, starting oracle SA tail")
+            while time.time() < deadline - oracle_time_est * 3:
+                ci = random.choice(movable_hard)
+                cx = float(np.clip(pos[ci, 0] + random.gauss(0, _osa_scale), hw[ci], cw - hw[ci]))
+                cy = float(np.clip(pos[ci, 1] + random.gauss(0, _osa_scale), hh[ci], ch - hh[ci]))
+                _osa_tries += 1
+                if _overlaps(ci, cx, cy):
+                    continue
+                old_x, old_y = float(pos[ci, 0]), float(pos[ci, 1])
+                pos[ci, 0] = cx; pos[ci, 1] = cy
+                all_cx[ci] = cx; all_cy[ci] = cy
+                cost = compute_proxy_cost(
+                    torch.tensor(pos, dtype=torch.float32), benchmark, plc
+                )["proxy_cost"]
+                oracle_calls += 1
+                delta = cost - best_cost
+                if delta < 0 or (delta < _osa_T and random.random() < math.exp(-delta / _osa_T)):
+                    _osa_accepted += 1
+                    if cost < best_cost:
+                        best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
+                        _osa_improved += 1
+                        _rebuild_fix_bbox_for_nets(macro_to_nets[ci])
+                        print(f"  [oSA] {cost:.4f}")
+                else:
+                    pos[ci, 0] = old_x; pos[ci, 1] = old_y
+                    all_cx[ci] = old_x; all_cy[ci] = old_y
+            if _osa_improved > 0 or _osa_accepted > 5:
+                print(f"  [oSA] {_osa_improved} improved, {_osa_accepted}/{_osa_tries} accepted")
+            # Verify oracle SA improvements survive legalization (prevents ibm06-type regression
+            # where oracle SA finds "better" positions with harder legalization cascade)
+            if _osa_improved > 0:
+                _post_micro = self._micro_legalize(torch.tensor(best_pos, dtype=torch.float32), benchmark)
+                if compute_overlap_metrics(_post_micro, benchmark)["overlap_count"] > 0:
+                    best_pos = _pre_osa_best_pos; best_cost = _pre_osa_best_cost
+                    print(f"  [oSA] reverted: legalization fails for oSA result")
+                else:
+                    best_pos = _post_micro.numpy()  # use micro-legalized result directly
+
+        elif not _osa_micro_ok and _osa_remain > oracle_time_est * 20:
+            # ILS restarts: micro_legalize fails for current best (needs legalize_hard).
+            # Try perturbed restarts to find a configuration where micro_legalize succeeds.
+            # Key for ibm06: SA tends to push macros to canvas boundaries (creating stuck
+            # pairs). Different random perturbations may avoid this.
+            _ils_budget_s = max(oracle_time_est * 12, min(oracle_time_est * 30, _osa_remain / 15))
+            _ils_scale = max(cw, ch) * 0.10
+            _ils_count = 0; _ils_ok_count = 0
+            print(f"  [ILS] {_osa_remain:.0f}s, ~{_osa_remain/_ils_budget_s:.0f} restarts planned")
+            while time.time() < deadline - oracle_time_est * 8:
+                _ils_count += 1
+                _prt = best_pos.copy()
+                _n_p = max(1, n_mv // 12)
+                for _pm in random.sample(movable_hard, min(_n_p, n_mv)):
+                    _prt[_pm, 0] = float(np.clip(_prt[_pm, 0] + random.gauss(0, _ils_scale), hw[_pm], cw - hw[_pm]))
+                    _prt[_pm, 1] = float(np.clip(_prt[_pm, 1] + random.gauss(0, _ils_scale), hh[_pm], ch - hh[_pm]))
+                _rebuild_state(_prt, best_ori)
+                _r_dead = min(deadline - oracle_time_est * 5, time.time() + _ils_budget_s)
+                _r_best = float('inf'); _r_pos = _prt.copy()
+                while time.time() < _r_dead:
+                    ci = random.choice(movable_hard)
+                    cx = float(np.clip(pos[ci, 0] + random.gauss(0, _ils_scale * 0.5), hw[ci], cw - hw[ci]))
+                    cy = float(np.clip(pos[ci, 1] + random.gauss(0, _ils_scale * 0.5), hh[ci], ch - hh[ci]))
+                    if _overlaps(ci, cx, cy): continue
+                    ox, oy = pos[ci, 0], pos[ci, 1]
+                    pos[ci, 0] = cx; pos[ci, 1] = cy; all_cx[ci] = cx; all_cy[ci] = cy
+                    r_cost = compute_proxy_cost(torch.tensor(pos, dtype=torch.float32), benchmark, plc)["proxy_cost"]
+                    oracle_calls += 1
+                    if r_cost < _r_best: _r_best = r_cost; _r_pos = pos.copy()
+                    else: pos[ci, 0] = ox; pos[ci, 1] = oy; all_cx[ci] = ox; all_cy[ci] = oy
+                _r_micro = self._micro_legalize(torch.tensor(_r_pos, dtype=torch.float32), benchmark)
+                if compute_overlap_metrics(_r_micro, benchmark)["overlap_count"] == 0:
+                    _ils_ok_count += 1
+                    _r_mc = compute_proxy_cost(_r_micro, benchmark, plc)["proxy_cost"]
+                    oracle_calls += 1
+                    if _r_mc < best_cost:
+                        best_cost = _r_mc; best_pos = _r_micro.numpy()
+                        print(f"  [ILS] restart {_ils_count}: micro OK, {_r_mc:.4f} (new best!)")
+                        _osa_micro_ok = True  # final legalization will use micro result
+                        break
+                _rebuild_state(best_pos, best_ori)
+            if _ils_count > 0:
+                print(f"  [ILS] {_ils_count} restarts ({_ils_ok_count} micro OK), best={best_cost:.4f}")
 
         # ── Final soft-macro update (revert if no gain) ───────────────────────
         _rebuild_state(best_pos, best_ori)
