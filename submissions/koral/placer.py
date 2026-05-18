@@ -1757,8 +1757,11 @@ class KoralPlacer:
                 _fast_cur  = _fast.evaluate(_pos_t)
                 _fast_best = _fast_cur
                 _fast_best_pos = pos.copy()
-                # Temperature in fast-eval scale
-                _osa_T = _fast_cur * 0.010
+                # Temperature in fast-eval scale.
+                # 0.001 × cost: accepts 91% of moves worsening by 0.1% (one typical step),
+                # 39% of moves worsening by 0.1 × cost (far worse). This is more selective
+                # than 0.010 (which would accept 99% of typical worsening moves = random walk).
+                _osa_T = _fast_cur * 0.001
                 # For congestion-dominated benchmarks (wl_frac < 0.15): delta_wl captures only
                 # ~6-15% of the cost signal; using it for translation leads to random-walk behavior.
                 # Use full fast.evaluate for ALL moves on these benchmarks (383x speedup is still huge).
