@@ -551,7 +551,13 @@ class KoralPlacer:
         """
         import subprocess, os, sys
 
-        xplace_home = os.environ.get('XPLACE_HOME', '/opt/xplace')
+        # On Linux/Docker, XPLACE_HOME defaults to /opt/xplace.
+        # On Windows (local), Git Bash converts /opt/xplace to a Windows path →
+        # skip cleanly since local Python has no GPU.
+        if os.name == 'nt':
+            xplace_home = '/opt/xplace'  # will fail exists check → skip
+        else:
+            xplace_home = os.environ.get('XPLACE_HOME', '/opt/xplace')
         xplace_main = os.path.join(xplace_home, 'main.py')
         if not os.path.exists(xplace_main):
             print(f"  [Xplace] not found at {xplace_main}")
@@ -618,6 +624,7 @@ class KoralPlacer:
             try:
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=600,
+                    cwd=xplace_home,  # Run from xplace_home so thirdparty/flute/POWV9.dat resolves
                     env={**os.environ, "PYTHONPATH": f"{xplace_home}:{os.environ.get('PYTHONPATH', '')}"}
                 )
                 elapsed = time.time() - t0
