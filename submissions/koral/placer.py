@@ -219,7 +219,10 @@ class KoralPlacer:
             best_placement = ct_legal
             _n_mv_dp = sum(1 for i in range(benchmark.num_hard_macros) if not benchmark.macro_fixed[i])
 
-            for _dp_center_init in ([False, True] if _n_mv_dp <= 260 else [False]):
+            # ibm01-size (≤260 macros): center-init finds global min (0.9221 vs CT 1.04);
+            # CT-init diverges here because CT positions are already dense.
+            # ibm02+ (>260 macros): CT-init is the warm start; center-init always diverges.
+            for _dp_center_init in ([True] if _n_mv_dp <= 260 else [False]):
                 _label = "center-init" if _dp_center_init else "CT-init"
                 try:
                     dp = self._run_dreamplace(benchmark, center_init=_dp_center_init,
@@ -1641,12 +1644,28 @@ class KoralPlacer:
         if _osa_remain > oracle_time_est * 5 and _osa_micro_ok:
             _pre_osa_best_pos = best_pos.copy(); _pre_osa_best_cost = best_cost  # save for revert
             _rebuild_state(best_pos, best_ori)
-            _osa_scale = max(cw, ch) * 0.04   # 4% canvas width; helps move boundary-stuck macros
+            # Adaptive scale: large early (broad exploration) → shrink over time (exploitation).
+            # Congestion-dominated benchmarks use a larger base scale (macros need bigger moves to
+            # escape congested bins; 4% probe would miss bin boundaries).
+            _osa_scale_base = max(cw, ch) * (0.08 if _wl_frac < 0.04 else 0.04)
             _osa_T = best_cost * 0.010         # 1% temperature: accepts ≤1% worse moves for exploration
             _osa_improved = 0; _osa_accepted = 0; _osa_tries = 0
+            _osa_t0 = time.time(); _osa_deadline = deadline - oracle_time_est * 3
             print(f"  [oSA] {_osa_remain:.0f}s remaining, starting oracle SA tail")
-            while time.time() < deadline - oracle_time_est * 3:
-                ci = random.choice(movable_hard)
+            # Macro selection weights: congestion-biased for congestion-dominated benchmarks.
+            # _cong_weights selects macros in high-congestion cells with higher probability,
+            # focusing oracle calls where they can reduce the dominant cost component.
+            _osa_mv_arr = np.array(movable_hard, dtype=np.int64)
+            _osa_probs = (None if _cong_weights is None
+                          else _cong_weights.astype(np.float64) / _cong_weights.sum())
+            while time.time() < _osa_deadline:
+                # Adaptive scale: decay from base to 25% of base as time runs out
+                _t_frac = min(1.0, (time.time() - _osa_t0) / max(1e-9, _osa_deadline - _osa_t0))
+                _osa_scale = _osa_scale_base * max(0.25, 1.0 - 0.75 * _t_frac)
+                if _osa_probs is not None:
+                    ci = int(np.random.choice(_osa_mv_arr, p=_osa_probs))
+                else:
+                    ci = random.choice(movable_hard)
                 cx = float(np.clip(pos[ci, 0] + random.gauss(0, _osa_scale), hw[ci], cw - hw[ci]))
                 cy = float(np.clip(pos[ci, 1] + random.gauss(0, _osa_scale), hh[ci], ch - hh[ci]))
                 _osa_tries += 1
