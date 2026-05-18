@@ -413,9 +413,8 @@ class KoralPlacer:
                 # CT-init: relax to 3% — CT positions start at ~4% overflow; a tight 1% target causes
                 # aggressive density optimization that diverges. 3% gives DREAMPlace useful WL
                 # optimization while being close enough to CT density to stay stable.
-                "gp_noise_ratio":     0.025 if center_init else 0.01,
-                # center-init: standard noise helps explore from random scatter.
-                # CT-init: low noise preserves near-optimal starting positions.
+                "gp_noise_ratio":     0.01,
+                # Low noise for both modes: 2.5% noise for center-init caused WL divergence.
                 "random_center_init_flag": 1 if center_init else 0,
                 "ignore_net_degree":  100,
                 "num_threads":        8,
