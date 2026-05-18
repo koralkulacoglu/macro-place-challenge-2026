@@ -453,22 +453,29 @@ class KoralPlacer:
             params = Params.Params(); params.load(params_path)
             placedb = PlaceDB.PlaceDB(); placedb(params)
 
-            # Compatibility fix: newer DREAMPlace sets quad_penalty=True after a divergence
-            # rollback on a PlaceObj that was initialized with quad_penalty=False (and thus
-            # never had quad_penalty_coeff set). Patch PlaceObj.__call__ (NOT __init__)
-            # so the fix applies to EXISTING instances created inside NonLinearPlace.__init__.
+            # Compatibility fix: newer DREAMPlace sets quad_penalty=True during a convergence
+            # stall. If init_density was set by a fence-region path before obj_fn's lazy init
+            # block runs, quad_penalty_coeff is never initialized. Patch PlaceObj.obj_fn so
+            # the guard runs before the attribute access.
+            # NonLinearPlace imports PlaceObj as a bare name; patch that module to affect the
+            # same class object (not dreamplace.PlaceObj which is a different sys.modules key).
             try:
-                import dreamplace.PlaceObj as _po
-                if not getattr(_po.PlaceObj, '_koral_qpc_patched', False):
-                    _orig_po_call = _po.PlaceObj.__call__
-                    def _patched_po_call(self, pos):
+                import PlaceObj as _po_mod
+            except ImportError:
+                try:
+                    import dreamplace.PlaceObj as _po_mod
+                except ImportError:
+                    _po_mod = None
+            if _po_mod is not None:
+                _PlaceObj_cls = _po_mod.PlaceObj
+                if not getattr(_PlaceObj_cls, '_koral_qpc_patched', False):
+                    _orig_obj_fn = _PlaceObj_cls.obj_fn
+                    def _patched_obj_fn(self, pos, _orig=_orig_obj_fn):
                         if not hasattr(self, 'quad_penalty_coeff') and getattr(self, 'quad_penalty', False):
-                            self.quad_penalty_coeff = 0.0  # safe default: disables quadratic penalty
-                        return _orig_po_call(self, pos)
-                    _po.PlaceObj.__call__ = _patched_po_call
-                    _po.PlaceObj._koral_qpc_patched = True
-            except Exception:
-                pass
+                            self.quad_penalty_coeff = 0.0  # disables quadratic penalty safely
+                        return _orig(self, pos)
+                    _PlaceObj_cls.obj_fn = _patched_obj_fn
+                    _PlaceObj_cls._koral_qpc_patched = True
 
             placer = NonLinearPlace.NonLinearPlace(params, placedb, timer=None)
             placer(params, placedb, learning_rate_value=None)
