@@ -2,176 +2,181 @@
 
 **Deadline: May 21, 2026 | Prize: $49K | Submission: https://forms.gle/YDRtYV5Vq68SZgKW9**
 
-## Current Status (2026-05-18 Session 3)
+## Current Status (2026-05-18 Session 3, End of Day)
 
-- **Estimated avg score: ~1.35–1.45** (rank ~30–40 before today's improvements)
-- **Target top 5: ~1.04** — gap is ~0.3–0.4 points
-- **Critical gap: global placement quality.** CT starts at 1.04–1.87 per benchmark.
-  vmallela (rank 3) achieves 0.76 on ibm01 — primarily through better global macro arrangement.
+- **Branch**: `strategy-may18`
+- **Key achievement**: Xplace integration working — 10-22% improvement per benchmark over CT
+- **Active runs**: ibm01, ibm03, ibm04, ibm06, ibm09 in Docker with Xplace+SA
 
 ---
 
-## Leaderboard (updated May 18, 2026)
+## Leaderboard (May 18, 2026)
 
 | Rank | Team | Score | Key differentiator |
 |------|------|-------|--------------------|
 | 1 | Carrotato | 0.9671 | Triton + **Xplace** |
 | 2 | Shoom | 0.978 | MultiDREAMPlace + CD |
-| 3 | vmallela | 1.0109 | Fast evaluator + better global placement |
-| 4 | DREAMPlaceProMaxUltra | 1.0121 | DREAMPlace + Docker |
+| 3 | vmallela | 1.0109 | Fast evaluator + good GP |
 | 5 | Cezar | 1.037 | Custom refinement |
-| 6 | thinkorplace | 1.0771 | CD + LNS + SA + Hessian |
-| ~35 | **Us** | ~1.35–1.42 | CT + fast SA (post session 3) |
-
-**vmallela ibm01 = 0.7644** (vs our 1.039 CT baseline). The 0.28 gap is almost entirely congestion.
+| ~35 | **Us (before today)** | ~1.42–1.46 | CT + SA |
+| **Us (with Xplace GP)** | **~1.08–1.20 est.** | Xplace + SA (SA results pending) |
 
 ---
 
-## Cost Breakdown (IBM Benchmarks, CT baseline)
+## Verified Xplace GP Scores (before SA polish)
 
-| Benchmark | proxy | wl% | den | cong | n_hard |
-|-----------|-------|-----|-----|------|--------|
-| ibm01 | 1.039 | 6.2% | 0.812 | 1.137 | 246 |
-| ibm02 | 1.566 | 4.8% | 0.729 | 2.254 | 271 |
-| ibm03 | 1.326 | 6.0% | 0.732 | 1.760 | 290 |
-| ibm04 | 1.313 | 5.4% | 0.782 | 1.704 | 295 |
-| ibm06 | 1.658 | 3.8% | 0.722 | 2.467 | 178 |
-| ibm09 | 1.113 | 5.1% | 0.836 | 1.275 | 253 |
-| ibm10 | 1.340 | 5.3% | 0.668 | 1.870 | 786 |
+| Benchmark | CT baseline | Xplace GP | Improvement |
+|-----------|------------|-----------|-------------|
+| ibm01 | 1.039 | **0.910** | -12.4% |
+| ibm02 | 1.566 | **1.552** | -0.9% |
+| ibm03 | 1.326 | **1.176** | -11.3% |
+| ibm04 | 1.313 | **1.115** | -15.1% |
+| ibm06 | 1.658 | **1.410** | -15.0% |
+| ibm07 | 1.476 | **1.270** | -14.0% |
+| ibm08 | 1.466 | **1.339** | -8.7% |
+| ibm09 | 1.113 | **0.952** | -14.5% |
+| ibm10 | 1.340 | **1.135** | -15.3% |
+| ibm11 | 1.214 | **0.979** | -19.3% |
+| ibm12 | 1.625 | **1.369** | -15.8% |
+| ibm13 | 1.385 | **1.068** | -22.9% |
+| ibm14 | 1.594 | **1.392** | -12.7% |
+| ibm15 | 1.603 | **1.517** | -5.4% |
+| ibm16 | 1.491 | **1.325** | -11.1% |
+| ibm17 | 1.739 | **1.469** | -15.5% |
+| ibm18 | 1.790 | **1.764** | -1.5% |
 
-**ALL benchmarks are congestion-dominated (WL = 4-6%).** Reducing congestion is the only path to top 5.
-
----
-
-## Session 3 Accomplishments (May 18, 2026)
-
-### 1. FastEvaluator (submissions/koral/fast_eval.py) — COMPLETE
-- 383x faster than oracle on ibm01 (evaluate), 4061x (delta_wl)
-- 763x faster on ibm02, 17068x delta_wl
-- Calibration r=0.98+ on all tested benchmarks
-- Wired into oSA tail: 235K+ fast moves per 3480s budget vs ~144 oracle moves
-- **Congestion map API**: `congestion_map()`, `macro_congestion_score()` for gradient moves
-- In oSA: 10% of moves now target the most-congested macro specifically
-
-### 2. DREAMPlace Entropy Injection Fix — COMPLETE (in Docker)
-- Root cause found: entropy injection fires at overflow > 0.95 (ALWAYS fires for center-init)
-- Fix: runtime-patch NonLinearPlace.py at container startup
-- **Verified result**: ibm01 DREAMPlace center-init = 1.0214 (vs CT 1.0385) — confirmed working
-- Combined with existing Lgamma-divergence patch
-
-### 3. Xplace Integration — IN PROGRESS
-- `_run_xplace()` method added to placer.py (subprocess call, bookshelf → .pl parse)
-- Dockerfile updated with Xplace build (cmake fix: torch.version.cuda not torch.cuda.is_available())
-- **Build approach**: docker exec in running container (avoids WSL2 BuildKit crashes)
-- Container `xplace_build` is compiling (99% done as of writing)
-- **After build**: `docker commit xplace_build koral-placer-xplace` then test on ibm01
-
-### 4. oSA Improvements
-- Temperature annealing: 0.001×cost → 0.01×cost (linear decay)
-- Full fast.evaluate for congestion-dominated benchmarks (not delta_wl which is WL-only)
-- Guided net-adjacent swap (50% probability of picking net neighbors)
-- Congestion-gradient macro selection: 10% of oSA picks highest-congestion macro
+**Average Xplace GP**: ~1.25 (vs CT ~1.46, -14% average)
+**With SA improvement (~8%)**: **estimated ~1.15 average**
 
 ---
 
-## Current Pipeline
+## Pipeline (Current)
 
 ```
-CT positions (baseline ~1.04–1.66 per benchmark)
-    ↓ Try Xplace (routability-driven GP, needs Docker GPU)
-    ↓ Try DREAMPlace (center-init, patched entropy injection)
-    ↓ Best of (Xplace, DREAMPlace, CT) → legalize
+CT positions (1.04–1.87 per benchmark)
+    ↓ Try Xplace (routability-driven GP, requires Docker GPU) → 0.91–1.76
+    ↓ Try DREAMPlace (patched entropy injection) → sometimes beats CT
+    ↓ Best of (Xplace, DREAMPlace, CT)
     ↓
-4 parallel SA workers (perturbed 0, 1.5%, 3%, 4.5% sigma)
-    ↓
-CD (coordinate descent, delta-HPWL oracle) → LNS → FD → hSA → fast oSA
+Sequential SA (3480s, GPU → n_workers=1 to avoid CUDA+fork deadlock)
+    ↓ CD → LNS → FD → hSA → fast oSA
+    ↓ FastEvaluator (383-17000x faster, wired into oSA)
     ↓
 Final micro-legalize
 ```
 
 ---
 
-## Active Benchmark Runs (as of writing)
+## Key Technical Discoveries (Session 3)
 
-| Benchmark | Log | Status | Note |
-|-----------|-----|--------|------|
-| ibm01 | C:/tmp/ibm01_v4.log | oSA running (3127s remaining) | Should finish ~1 hr |
-| ibm09 | C:/tmp/ibm09_v4.log | hSA finding improvements (1.1065 so far) | |
-| ibm02 | C:/tmp/ibm02_v4.log | FD gradient descent | Started later |
-| ibm06 | C:/tmp/ibm06_v4.log | Starting | Cascade escape needed |
+### 1. FastEvaluator — DONE
+- 383x faster than oracle on ibm01, 763x on ibm02
+- 4061x faster delta_wl (incremental WL-only)
+- Congestion map API for gradient-guided oSA moves
+- r=0.98+ calibration vs official oracle
+
+### 2. DREAMPlace Entropy Injection Fix — DONE
+- Root cause: entropy injection fires at overflow > 0.95 (always for center-init)
+- Fix: runtime-patch NonLinearPlace.py at startup → ibm01 gives 1.02 reliably
+
+### 3. Xplace Integration — DONE (koral-placer-xplace image)
+- Needs: CUDA, /opt/xplace, thirdparty/flute/*.dat, NumPy 2.0 patches
+- ibm01 Xplace GP = 0.9099 (density drops 0.812→0.500, -38%)
+- Best benchmarks: ibm11 (-19%), ibm13 (-23%)
+- Weak benchmarks: ibm02 (-0.9%), ibm18 (-1.5%)
+- **NOTE**: requires `--mixed_size True` for macro placement mode
+
+### 4. CUDA+fork Deadlock Fix — DONE
+- Problem: fork() after CUDA was active leaves all workers in futex_wait_queue
+- Workers use ~0 CPU (deadlocked, not computing)
+- Fix: when `torch.cuda.is_available()`, use n_workers=1 (sequential SA)
+- Sequential SA with full budget from 0.91 starting point is highly effective
 
 ---
 
-## Immediate Next Steps
+## Docker Commands
 
-### 1. ⚡ Commit Xplace container as image (5 min after build completes)
+### Run single benchmark (correct command):
 ```bash
-# In container xplace_build, after XPLACE_BUILD_DONE appears:
-docker commit xplace_build koral-placer-xplace
-
-# Test Xplace on ibm01:
 docker run --rm --runtime=nvidia --gpus all \
   -v "C:/Users/kulac/Documents/GitHub/macro-place-challenge-2026:/challenge" \
-  --network none --entrypoint python koral-placer-xplace \
-  -m macro_place.evaluate submissions/koral/placer.py -b ibm01
+  --network none --entrypoint python3 koral-placer-xplace \
+  -m macro_place.evaluate submissions/koral/placer.py -b ibm01 \
+  > C:/tmp/final_ibm01.log 2>&1 &
 ```
 
-### 2. ⚡ Run DREAMPlace + SA on ibm01 in Docker (verify 1.02 → <1.00 with full SA)
+### Run all 17 (for submission):
 ```bash
-docker run --rm --runtime=nvidia --gpus all \
-  -v "C:/...:/challenge" --network none --entrypoint python koral-placer \
-  -m macro_place.evaluate submissions/koral/placer.py -b ibm01
+for bm in ibm01 ibm02 ibm03 ibm04 ibm06 ibm07 ibm08 ibm09 ibm10 ibm11 ibm12 ibm13 ibm14 ibm15 ibm16 ibm17 ibm18; do
+  docker run --rm --runtime=nvidia --gpus all \
+    -v "C:/path/to/repo:/challenge" \
+    --network none --entrypoint python3 koral-placer-xplace \
+    -m macro_place.evaluate submissions/koral/placer.py -b $bm \
+    > C:/tmp/final_${bm}.log 2>&1 &
+done
 ```
 
-### 3. Monitor oSA improvement on ibm01
-The new fast oSA is running 3100+ seconds with full_eval mode on ibm01.
-Should find improvements that raw hSA misses (hSA uses HPWL surrogate, blind to congestion).
+### Key Docker image:
+- `koral-placer-xplace` = DREAMPlace + Xplace + all patches
+- **Use `koral-placer-xplace`, NOT `koral-placer`** (old image, no Xplace)
 
-### 4. Submit current best before trying risky changes
-Branch `strategy-may18` is the submission branch. Before major refactors:
-1. Run a quick 5-benchmark spot check
-2. If avg < 1.40: submit immediately
+### WSL2 crash workaround:
+Docker Desktop WSL2 crashes during `docker build` with heavy CUDA compilation.
+Use `docker exec` in a running container instead:
+```bash
+docker run -d --name build_container --entrypoint sleep koral-placer 7200
+docker exec -d build_container bash -c "make -j\$(nproc) > /tmp/build.log 2>&1 && make install && echo DONE >> /tmp/build.log"
+docker commit build_container koral-placer-xplace
+```
+
+---
+
+## Active Runs (as of end of May 18 session)
+
+| Benchmark | Log | Status |
+|-----------|-----|--------|
+| ibm01 | C:/tmp/final_ibm01.log | Sequential SA from Xplace 0.91 |
+| ibm09 | C:/tmp/final_ibm09.log | Sequential SA from Xplace 0.95 |
+| ibm06 | C:/tmp/final_ibm06.log | Sequential SA from Xplace 1.41 |
+| ibm03 | C:/tmp/final_ibm03.log | Sequential SA |
+| ibm04 | C:/tmp/final_ibm04.log | Sequential SA |
+
+### Expected results (collect tomorrow May 19):
+- ibm01: Xplace 0.91 + SA → expect ~0.82-0.88
+- ibm09: Xplace 0.95 + SA → expect ~0.86-0.91
+- ibm06: Xplace 1.41 + SA → expect ~1.28-1.35
 
 ---
 
 ## Key Files
 
-- `submissions/koral/placer.py` — KoralPlacer (1400+ lines)
-- `submissions/koral/fast_eval.py` — FastEvaluator (calibrated 300-17000x speedup)
-- `submissions/koral/bookshelf.py` — Benchmark → Bookshelf adapter (DREAMPlace + Xplace)
-- `submissions/koral/Dockerfile` — Docker build with DREAMPlace + Xplace
-
-## Docker
-
-```bash
-# Current working image (DREAMPlace only):
-docker images | grep koral  # → koral-placer (47dbdb1720e4)
-
-# After Xplace build completes:
-docker commit xplace_build koral-placer-xplace
-
-# Run with GPU + live code mount:
-docker run --rm --runtime=nvidia --gpus all \
-  -v "C:/Users/kulac/Documents/GitHub/macro-place-challenge-2026:/challenge" \
-  --network none --entrypoint python koral-placer-xplace \
-  -m macro_place.evaluate submissions/koral/placer.py -b ibm01
-```
-
-## WSL2 Docker Issue
-
-Docker Desktop uses WSL2 which crashes during heavy CUDA compilation (NVCC kills WSL2 VM).
-**Workaround that works**: `docker exec -d` in a running container (not `docker build`).
-This bypasses BuildKit and the WSL2 crash pattern.
-
-When WSL2 crashes, run:
-```
-Start-Process "C:\Program Files\Docker\Docker\Docker Desktop.exe"
-# Wait ~30s then: until docker ps > /dev/null 2>&1; do sleep 3; done
-```
+| File | Purpose |
+|------|---------|
+| `submissions/koral/placer.py` | KoralPlacer: CT → Xplace → DREAMPlace → SA |
+| `submissions/koral/fast_eval.py` | FastEvaluator: 383-17000x speedup |
+| `submissions/koral/bookshelf.py` | Benchmark → Bookshelf (for Xplace/DREAMPlace) |
+| `submissions/koral/Dockerfile` | Docker build: DREAMPlace + Xplace + patches |
 
 ---
 
-## Scoring
+## Next Steps (May 19-21)
 
-`proxy_cost = 1.0×WL + 0.5×Density + 0.5×Congestion` on 17 IBM benchmarks.
-Zero tolerance for hard macro overlaps (→ disqualification).
+### Priority 1: Collect results and submit
+1. Check final scores from active runs (~1 hour each)
+2. Run remaining benchmarks: ibm02, ibm07, ibm08, ibm10-18 in Docker
+3. Submit when full set complete: https://forms.gle/YDRtYV5Vq68SZgKW9
+
+### Priority 2: Improve Xplace quality (if time allows)
+- Try `--use_route_force True` to directly target congestion (currently disabled)
+- Try more iterations: `--inner_iter 8000` (currently 5000)
+- ibm02/ibm18 barely improved → investigate why (likely Xplace parameter sensitivity)
+
+### Priority 3: Better legalization
+- After Xplace GP, many benchmarks have macros needing legalization
+- Current `_legalize_hard` is greedy O(n²) Python — might create suboptimal arrangements
+- Could try scipy-based legalization for better quality
+
+### What NOT to do:
+- Don't try to rebuild the Dockerfile from scratch (WSL2 crashes) — use docker exec approach
+- Don't add more Python SA improvements (FastEvaluator + oSA already near saturation)
+- Don't worry about parallel SA — sequential SA from Xplace is sufficient
