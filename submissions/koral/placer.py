@@ -209,8 +209,9 @@ class KoralPlacer:
         n_mv_hard = sum(1 for i in range(benchmark.num_hard_macros)
                         if not benchmark.macro_fixed[i])
 
-        if _dreamplace_available():
-            # Run DREAMPlace and keep result only if it beats CT — zero downside risk.
+        # Skip DREAMPlace if SA budget is too short (DREAMPlace would eat all the time).
+        # CPU DREAMPlace: ~2-3 min. Only worth running if SA gets meaningful time after.
+        if _dreamplace_available() and self.sa_time_budget >= 300:
             # CT-init (warm start): better for large benchmarks (ibm02-18) where center-init diverges.
             # Center-init (random scatter): historically best for ibm01 (finds 0.9221 vs CT 1.04).
             # Strategy: always try CT-init; also try center-init for small benchmarks (≤260 macros).
@@ -367,11 +368,12 @@ class KoralPlacer:
                 # GPU: fast enough for many iterations on all benchmark sizes.
                 _iters1, _iters2 = 2000, 3000
             elif n_mv_hard > 260:
-                # CPU, large benchmark (ibm02+): keep modest to limit runtime.
-                _iters1, _iters2 = 500, 700
+                # CPU, large benchmark (ibm02+): CT-init diverges often; limit wasted time.
+                _iters1, _iters2 = 200, 300
             else:
-                # CPU, small benchmark (ibm01): more iterations, good quality.
-                _iters1, _iters2 = 1000, 1500
+                # CPU, small benchmark (ibm01 or ibm06-size): center-init converges fast.
+                # Keep short to avoid consuming >2 min on the judge's 1-hr per-benchmark limit.
+                _iters1, _iters2 = 300, 500
 
             # Build DREAMPlace params
             params_dict = {
