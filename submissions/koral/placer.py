@@ -1757,11 +1757,17 @@ class KoralPlacer:
                 _fast_cur  = _fast.evaluate(_pos_t)
                 _fast_best = _fast_cur
                 _fast_best_pos = pos.copy()
-                # Temperature in fast-eval scale (a*oracle_T ≈ fast_cost * 0.010)
+                # Temperature in fast-eval scale
                 _osa_T = _fast_cur * 0.010
-                _osa_sync_interval = 500   # full re-sync every N fast steps
+                # For congestion-dominated benchmarks (wl_frac < 0.15): delta_wl captures only
+                # ~6-15% of the cost signal; using it for translation leads to random-walk behavior.
+                # Use full fast.evaluate for ALL moves on these benchmarks (383x speedup is still huge).
+                # For WL-dominated (wl_frac >= 0.15): delta_wl captures majority of signal → safe.
+                _osa_use_delta_wl = (_wl_frac >= 0.15)
+                _osa_sync_interval = 500 if _osa_use_delta_wl else 1  # sync=1 means always full evaluate
                 _osa_delta_steps   = 0
-                print(f"  [oSA] fast_eval active ({_osa_remain:.0f}s, fast_cur={_fast_cur:.4f})")
+                print(f"  [oSA] fast_eval active ({_osa_remain:.0f}s, fast_cur={_fast_cur:.4f}, "
+                      f"mode={'delta_wl' if _osa_use_delta_wl else 'full_eval'})")
             else:
                 _osa_T = best_cost * 0.010
 
