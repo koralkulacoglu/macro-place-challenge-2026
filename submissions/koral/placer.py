@@ -258,6 +258,15 @@ class KoralPlacer:
             # Parallel SA: spawn N independent workers with different seeds, keep best result.
             # Uses fork (Linux/Docker only) so workers inherit parent memory without pickling.
             # Falls back to sequential on Windows (spawn has import-path complexity).
+            #
+            # CUDA + fork deadlock: PyTorch fork with active CUDA context deadlocks all workers
+            # on futex_wait_queue. Happens when Xplace/DREAMPlace used CUDA before fork.
+            # Fix: hide CUDA from workers by setting CUDA_VISIBLE_DEVICES="" before fork.
+            # Workers only use CPU oracle (plc.get_cost() is pure Python), so this is safe.
+            _cuda_was_active = torch.cuda.is_available()
+            if _cuda_was_active:
+                _orig_cuda_vis = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+                os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # hide GPU from forked workers
             n_workers = (min(4, os.cpu_count() or 1)
                          if sys.platform != 'win32' else 1)
             if n_workers > 1:
@@ -302,6 +311,13 @@ class KoralPlacer:
                 for p in procs: p.join()
                 results = [result_q.get() for _ in procs]
 
+                # Restore CUDA after parallel SA (workers hid GPU)
+                if _cuda_was_active:
+                    if _orig_cuda_vis is None:
+                        os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+                    else:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = _orig_cuda_vis
+
                 best_cost, best_np = float('inf'), None
                 for res_np, cost in results:
                     if cost < best_cost:
@@ -310,6 +326,12 @@ class KoralPlacer:
                     placement = torch.from_numpy(best_np)
                 print(f"  [parallel-SA] best cost {best_cost:.4f}")
             else:
+                # Restore CUDA (sequential SA path)
+                if _cuda_was_active:
+                    if _orig_cuda_vis is None:
+                        os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+                    else:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = _orig_cuda_vis
                 placement = self._cd_lns_polish(placement, benchmark, plc)
 
         return placement
