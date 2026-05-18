@@ -41,7 +41,8 @@ RUN git clone --depth=1 --recursive https://github.com/limbo018/DREAMPlace.git /
 
 # Apply compatibility patches (CUDA 12.4 / NumPy 2.0 / detailed-placement disabled)
 COPY submissions/koral/patch_dreamplace.sh /tmp/patch_dreamplace.sh
-RUN bash /tmp/patch_dreamplace.sh /tmp/dreamplace_src
+# Strip Windows CRLF line endings that git adds on Windows hosts before running on Linux
+RUN sed -i 's/\r$//' /tmp/patch_dreamplace.sh && bash /tmp/patch_dreamplace.sh /tmp/dreamplace_src
 
 # Make libcuda.so stub visible so cmake's find_package(CUDA) succeeds without a GPU device
 RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so
