@@ -1786,6 +1786,9 @@ class KoralPlacer:
                 # Adaptive scale: decay from base to 25% of base as time runs out
                 _t_frac = min(1.0, (time.time() - _osa_t0) / max(1e-9, _osa_deadline - _osa_t0))
                 _osa_scale = _osa_scale_base * max(0.25, 1.0 - 0.75 * _t_frac)
+                # Temperature annealing: hot → cold over oSA budget.
+                # At t=0: T = _osa_T (initial). At t=1: T = 0.01 × _osa_T (near-greedy).
+                _osa_T_cur = _osa_T * max(0.01, 1.0 - 0.99 * _t_frac)
                 if _osa_probs is not None:
                     ci = int(np.random.choice(_osa_mv_arr, p=_osa_probs))
                 else:
@@ -1822,7 +1825,7 @@ class KoralPlacer:
                         )["proxy_cost"]
                         oracle_calls += 1
                         delta = cost - best_cost
-                    if delta < 0 or (delta < _osa_T and random.random() < math.exp(-delta / _osa_T)):
+                    if delta < 0 or (delta < _osa_T_cur and random.random() < math.exp(-delta / _osa_T_cur)):
                         _osa_accepted += 1
                         if _use_fast_osa:
                             _fast_cur = cost
@@ -1870,7 +1873,7 @@ class KoralPlacer:
                     )["proxy_cost"]
                     oracle_calls += 1
                     delta = cost - best_cost
-                if delta < 0 or (delta < _osa_T and random.random() < math.exp(-delta / _osa_T)):
+                if delta < 0 or (delta < _osa_T_cur and random.random() < math.exp(-delta / _osa_T_cur)):
                     _osa_accepted += 1
                     if _use_fast_osa:
                         _fast_cur = cost
