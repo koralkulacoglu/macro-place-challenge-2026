@@ -251,10 +251,29 @@ class KoralPlacer:
             if n_workers > 1:
                 import multiprocessing as _mp
                 print(f"  [parallel-SA] {n_workers} workers, seeds {self.seed}..{self.seed+n_workers-1}")
-                args_list = [
-                    (benchmark.name, placement.numpy().copy(), self.sa_time_budget, self.seed + i)
-                    for i in range(n_workers)
-                ]
+                # Worker 0: exact best placement (exploitation).
+                # Workers 1+: increasingly perturbed starts (exploration diversity).
+                # Perturbation ensures workers explore different basins of attraction.
+                _base_np = placement.numpy()
+                _mv_mask = benchmark.get_movable_mask().numpy().astype(bool)
+                _hw_arr = benchmark.macro_sizes[:, 0].numpy() / 2
+                _hh_arr = benchmark.macro_sizes[:, 1].numpy() / 2
+                _cw_f, _ch_f = float(benchmark.canvas_width), float(benchmark.canvas_height)
+                _rng_p = np.random.RandomState(self.seed)
+                args_list = []
+                for i in range(n_workers):
+                    _start = _base_np.copy()
+                    if i > 0:
+                        _sigma = max(_cw_f, _ch_f) * (0.04 * i)  # 4%, 8%, 12% for workers 1,2,3
+                        for mi in range(benchmark.num_hard_macros):
+                            if _mv_mask[mi]:
+                                _start[mi, 0] = float(np.clip(
+                                    _start[mi, 0] + _rng_p.normal(0, _sigma),
+                                    _hw_arr[mi], _cw_f - _hw_arr[mi]))
+                                _start[mi, 1] = float(np.clip(
+                                    _start[mi, 1] + _rng_p.normal(0, _sigma),
+                                    _hh_arr[mi], _ch_f - _hh_arr[mi]))
+                    args_list.append((benchmark.name, _start, self.sa_time_budget, self.seed + i))
                 ctx = _mp.get_context('fork')
                 result_q = ctx.Queue()
 
