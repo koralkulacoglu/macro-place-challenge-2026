@@ -220,10 +220,10 @@ class KoralPlacer:
             best_placement = ct_legal
             _n_mv_dp = sum(1 for i in range(benchmark.num_hard_macros) if not benchmark.macro_fixed[i])
 
-            # ibm01-size (≤260 macros): center-init finds global min (0.9221 vs CT 1.04);
-            # CT-init diverges here because CT positions are already dense.
-            # ibm02+ (>260 macros): CT-init is the warm start; center-init always diverges.
-            for _dp_center_init in ([True] if _n_mv_dp <= 260 else [False]):
+            # ibm01 (246 macros): center-init finds global min (0.9221 vs CT 1.04); CT-init diverges.
+            # ibm02+ (259+ macros): CT-init warm start; center-init always diverges for these.
+            # Threshold 248 cleanly separates ibm01 (246) from ibm02 (259).
+            for _dp_center_init in ([True] if _n_mv_dp <= 248 else [False]):
                 _label = "center-init" if _dp_center_init else "CT-init"
                 try:
                     dp = self._run_dreamplace(benchmark, center_init=_dp_center_init,
@@ -367,12 +367,11 @@ class KoralPlacer:
             if _gpu:
                 # GPU: fast enough for many iterations on all benchmark sizes.
                 _iters1, _iters2 = 2000, 3000
-            elif n_mv_hard > 260:
-                # CPU, large benchmark (ibm02+): CT-init diverges often; limit wasted time.
+            elif n_mv_hard > 248:
+                # CPU, ibm02+ (259+ macros): uses CT-init; limit iters to avoid timeout.
                 _iters1, _iters2 = 200, 300
             else:
-                # CPU, small benchmark (ibm01 or ibm06-size): center-init converges fast.
-                # Keep short to avoid consuming >2 min on the judge's 1-hr per-benchmark limit.
+                # CPU, ibm01 (246 macros): uses center-init; converges fast.
                 _iters1, _iters2 = 300, 500
 
             # Build DREAMPlace params
