@@ -69,6 +69,9 @@ RUN git clone --depth=1 --recurse-submodules \
         https://github.com/cuhk-eda/Xplace.git /tmp/xplace_src \
     && cd /tmp/xplace_src \
     && pip install --no-cache-dir pandas loguru \
+    && sed -i \
+        's/int(torch.cuda.is_available())/int(torch.version.cuda is not None)/' \
+        CMakeLists.txt \
     && mkdir build && cd build \
     && cmake .. \
         -DCMAKE_INSTALL_PREFIX=/opt/xplace \
