@@ -1207,6 +1207,17 @@ class KoralPlacer:
         best_ori  = ori.copy()
         print(f"  [CD] initial={init_cost:.4f} (wl_frac={_wl_frac:.2%})")
 
+        # ── Fast evaluator (300-4000x speedup for SA inner loops) ────────────
+        # Calibrate once here; oracle stays synced from initial eval above.
+        try:
+            from fast_eval import FastEvaluator as _FE
+            _fast = _FE(benchmark, plc)
+            _fast_r = _fast.calibrate(benchmark, plc, n_samples=5)
+            _fast_ok = _fast_r > 0.90
+        except Exception as _fe_err:
+            print(f"  [fast_eval] unavailable: {_fe_err}")
+            _fast = None; _fast_ok = False
+
         # Build congestion-guided macro weights (static snapshot after initial eval).
         # plc is now synced; query per-cell routing congestion and map movable macros to cells.
         _cong_weights = None   # None = uniform random selection (high-cong bias)
@@ -1722,10 +1733,29 @@ class KoralPlacer:
             # Congestion-dominated benchmarks use a larger base scale (macros need bigger moves to
             # escape congested bins; 4% probe would miss bin boundaries).
             _osa_scale_base = max(cw, ch) * (0.08 if _wl_frac < 0.04 else 0.04)
-            _osa_T = best_cost * 0.010         # 1% temperature: accepts ≤1% worse moves for exploration
+
+            # ── oSA uses fast evaluator when available (300-17000x speedup) ──
+            # fast.evaluate: 383-763x faster than oracle (full WL+density+cong approx)
+            # fast.delta_wl: 4000-17000x faster (WL-only incremental, for translations)
+            # Fall back to oracle if fast evaluator is unavailable or miscalibrated.
+            _use_fast_osa = _fast_ok and _fast is not None
+            if _use_fast_osa:
+                _pos_t = torch.tensor(pos, dtype=torch.float32)
+                _fast_cur  = _fast.evaluate(_pos_t)
+                _fast_best = _fast_cur
+                _fast_best_pos = pos.copy()
+                # Temperature in fast-eval scale (a*oracle_T ≈ fast_cost * 0.010)
+                _osa_T = _fast_cur * 0.010
+                _osa_sync_interval = 500   # full re-sync every N fast steps
+                _osa_delta_steps   = 0
+                print(f"  [oSA] fast_eval active ({_osa_remain:.0f}s, fast_cur={_fast_cur:.4f})")
+            else:
+                _osa_T = best_cost * 0.010
+
             _osa_improved = 0; _osa_accepted = 0; _osa_tries = 0
             _osa_t0 = time.time(); _osa_deadline = deadline - oracle_time_est * 3
-            print(f"  [oSA] {_osa_remain:.0f}s remaining, starting oracle SA tail")
+            if not _use_fast_osa:
+                print(f"  [oSA] {_osa_remain:.0f}s remaining, starting oracle SA tail")
             # Macro selection weights: congestion-biased for congestion-dominated benchmarks.
             # _cong_weights selects macros in high-congestion cells with higher probability,
             # focusing oracle calls where they can reduce the dominant cost component.
@@ -1763,17 +1793,28 @@ class KoralPlacer:
                         pos[ci, 0] = oxi; pos[ci, 1] = oyi; all_cx[ci] = oxi; all_cy[ci] = oyi
                         pos[cj, 0] = oxj; pos[cj, 1] = oyj; all_cx[cj] = oxj; all_cy[cj] = oyj
                         continue
-                    cost = compute_proxy_cost(
-                        torch.tensor(pos, dtype=torch.float32), benchmark, plc
-                    )["proxy_cost"]
-                    oracle_calls += 1
-                    delta = cost - best_cost
+                    if _use_fast_osa:
+                        # Swap: use full fast.evaluate (delta_wl doesn't capture 2-macro moves well)
+                        cost = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
+                        delta = cost - _fast_cur
+                    else:
+                        cost = compute_proxy_cost(
+                            torch.tensor(pos, dtype=torch.float32), benchmark, plc
+                        )["proxy_cost"]
+                        oracle_calls += 1
+                        delta = cost - best_cost
                     if delta < 0 or (delta < _osa_T and random.random() < math.exp(-delta / _osa_T)):
                         _osa_accepted += 1
-                        if cost < best_cost:
-                            best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
-                            _osa_improved += 1
-                            print(f"  [oSA] {cost:.4f}")
+                        if _use_fast_osa:
+                            _fast_cur = cost
+                            if cost < _fast_best:
+                                _fast_best = cost; _fast_best_pos = pos.copy()
+                                _osa_improved += 1
+                        else:
+                            if cost < best_cost:
+                                best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
+                                _osa_improved += 1
+                                print(f"  [oSA] {cost:.4f}")
                     else:
                         pos[ci, 0] = oxi; pos[ci, 1] = oyi; all_cx[ci] = oxi; all_cy[ci] = oyi
                         pos[cj, 0] = oxj; pos[cj, 1] = oyj; all_cx[cj] = oxj; all_cy[cj] = oyj
@@ -1785,43 +1826,92 @@ class KoralPlacer:
                 if _overlaps(ci, cx, cy):
                     continue
                 old_x, old_y = float(pos[ci, 0]), float(pos[ci, 1])
-                pos[ci, 0] = cx; pos[ci, 1] = cy
-                all_cx[ci] = cx; all_cy[ci] = cy
-                cost = compute_proxy_cost(
-                    torch.tensor(pos, dtype=torch.float32), benchmark, plc
-                )["proxy_cost"]
-                oracle_calls += 1
-                delta = cost - best_cost
+                # Apply move to pos (needed for both fast and oracle evaluation)
+                pos[ci, 0] = cx; pos[ci, 1] = cy; all_cx[ci] = cx; all_cy[ci] = cy
+                if _use_fast_osa:
+                    # Translation: delta_wl or periodic full re-sync
+                    _osa_delta_steps += 1
+                    if _osa_delta_steps >= _osa_sync_interval:
+                        # Full re-sync (pos already updated above)
+                        cost = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
+                        _osa_delta_steps = 0
+                    else:
+                        # Incremental: recompute only affected nets (pos already updated)
+                        # Temporarily restore old pos to compute delta from correct baseline
+                        pos[ci, 0] = old_x; pos[ci, 1] = old_y
+                        d_wl = _fast.delta_wl(
+                            torch.tensor(pos, dtype=torch.float32), ci, cx, cy
+                        )
+                        pos[ci, 0] = cx; pos[ci, 1] = cy
+                        cost = _fast_cur + d_wl
+                    delta = cost - _fast_cur
+                if not _use_fast_osa:
+                    cost = compute_proxy_cost(
+                        torch.tensor(pos, dtype=torch.float32), benchmark, plc
+                    )["proxy_cost"]
+                    oracle_calls += 1
+                    delta = cost - best_cost
                 if delta < 0 or (delta < _osa_T and random.random() < math.exp(-delta / _osa_T)):
                     _osa_accepted += 1
-                    if cost < best_cost:
-                        best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
-                        _osa_improved += 1
-                        _rebuild_fix_bbox_for_nets(macro_to_nets[ci])
-                        print(f"  [oSA] {cost:.4f}")
-                        # Refresh congestion weights on improvement to track updated hotspots
-                        if _osa_probs is not None and _cong_weights is not None:
-                            try:
-                                _h2 = np.array(plc.get_horizontal_routing_congestion(), dtype=np.float32)
-                                _v2 = np.array(plc.get_vertical_routing_congestion(), dtype=np.float32)
-                                _mc2 = np.array([(_h2+_v2)[c] if 0<=c<len(_h2) else 0.0
-                                                 for c in [plc.get_grid_cell_of_node(p) for p in _plc_ids]],
-                                                dtype=np.float32)
-                                _thr2 = float(np.percentile(_mc2, 50))
-                                _wts2 = np.maximum(0.0, _mc2 - _thr2).astype(np.float64)
-                                if _wts2.sum() > 0:
-                                    _cong_weights = _wts2 / _wts2.sum()
-                                    _osa_probs = _cong_weights / _cong_weights.sum()
-                            except Exception:
-                                pass
+                    if _use_fast_osa:
+                        _fast_cur = cost
+                        if cost < _fast_best:
+                            _fast_best = cost; _fast_best_pos = pos.copy()
+                            _osa_improved += 1
+                            _rebuild_fix_bbox_for_nets(macro_to_nets[ci])
+                    else:
+                        if cost < best_cost:
+                            best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
+                            _osa_improved += 1
+                            _rebuild_fix_bbox_for_nets(macro_to_nets[ci])
+                            print(f"  [oSA] {cost:.4f}")
+                            # Refresh congestion weights on improvement to track updated hotspots
+                            if _osa_probs is not None and _cong_weights is not None:
+                                try:
+                                    _h2 = np.array(plc.get_horizontal_routing_congestion(), dtype=np.float32)
+                                    _v2 = np.array(plc.get_vertical_routing_congestion(), dtype=np.float32)
+                                    _mc2 = np.array([(_h2+_v2)[c] if 0<=c<len(_h2) else 0.0
+                                                     for c in [plc.get_grid_cell_of_node(p) for p in _plc_ids]],
+                                                    dtype=np.float32)
+                                    _thr2 = float(np.percentile(_mc2, 50))
+                                    _wts2 = np.maximum(0.0, _mc2 - _thr2).astype(np.float64)
+                                    if _wts2.sum() > 0:
+                                        _cong_weights = _wts2 / _wts2.sum()
+                                        _osa_probs = _cong_weights / _cong_weights.sum()
+                                except Exception:
+                                    pass
                 else:
                     pos[ci, 0] = old_x; pos[ci, 1] = old_y
                     all_cx[ci] = old_x; all_cy[ci] = old_y
-            if _osa_improved > 0 or _osa_accepted > 5:
-                print(f"  [oSA] {_osa_improved} improved, {_osa_accepted}/{_osa_tries} accepted")
-            # Verify oracle SA improvements survive legalization (prevents ibm06-type regression
-            # where oracle SA finds "better" positions with harder legalization cascade)
-            if _osa_improved > 0:
+
+            # ── After fast oSA: oracle verify best candidate ──────────────────
+            if _use_fast_osa:
+                # Use fast-best position; verify with oracle
+                pos[:] = _fast_best_pos; ori[:] = best_ori
+                all_cx[:n_mac] = pos[:n_mac, 0]; all_cy[:n_mac] = pos[:n_mac, 1]
+                _osa_oracle_cost = compute_proxy_cost(
+                    torch.tensor(pos, dtype=torch.float32), benchmark, plc
+                )["proxy_cost"]
+                oracle_calls += 1
+                print(f"  [oSA] {_osa_tries} fast moves, {_osa_improved} fast-best updates; "
+                      f"oracle={_osa_oracle_cost:.4f} vs pre-oSA={_pre_osa_best_cost:.4f}")
+                if _osa_oracle_cost < _pre_osa_best_cost:
+                    best_cost = _osa_oracle_cost; best_pos = pos.copy(); best_ori = ori.copy()
+                    _osa_improved_verified = True
+                else:
+                    pos[:] = _pre_osa_best_pos; ori[:] = best_ori
+                    all_cx[:n_mac] = pos[:n_mac, 0]; all_cy[:n_mac] = pos[:n_mac, 1]
+                    best_pos = _pre_osa_best_pos; best_cost = _pre_osa_best_cost
+                    _osa_improved_verified = False
+                    print(f"  [oSA] reverted: fast-best not oracle-confirmed")
+            else:
+                _osa_improved_verified = _osa_improved > 0
+                if _osa_improved > 0 or _osa_accepted > 5:
+                    print(f"  [oSA] {_osa_improved} improved, {_osa_accepted}/{_osa_tries} accepted")
+
+            # Verify oSA improvements survive legalization (prevents ibm06-type regression
+            # where oSA finds "better" positions with harder legalization cascade)
+            if _osa_improved_verified:
                 _post_micro = self._micro_legalize(torch.tensor(best_pos, dtype=torch.float32), benchmark)
                 if compute_overlap_metrics(_post_micro, benchmark)["overlap_count"] > 0:
                     best_pos = _pre_osa_best_pos; best_cost = _pre_osa_best_cost
@@ -1864,7 +1954,10 @@ class KoralPlacer:
                         _prt[_pm, 1] = float(np.clip(_prt[_pm, 1] + random.gauss(0, _ils_scale), hh[_pm], ch - hh[_pm]))
                 _rebuild_state(_prt, best_ori)
                 _r_dead = min(deadline - oracle_time_est * 5, time.time() + _ils_budget_s)
+                _r_best_fast = float('inf') if _fast_ok else float('inf')
                 _r_best = float('inf'); _r_pos = _prt.copy()
+                if _fast_ok and _fast is not None:
+                    _r_best_fast = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
                 while time.time() < _r_dead:
                     ci = random.choice(movable_hard)
                     cx = float(np.clip(pos[ci, 0] + random.gauss(0, _ils_scale * 0.5), hw[ci], cw - hw[ci]))
@@ -1872,10 +1965,15 @@ class KoralPlacer:
                     if _overlaps(ci, cx, cy): continue
                     ox, oy = pos[ci, 0], pos[ci, 1]
                     pos[ci, 0] = cx; pos[ci, 1] = cy; all_cx[ci] = cx; all_cy[ci] = cy
-                    r_cost = compute_proxy_cost(torch.tensor(pos, dtype=torch.float32), benchmark, plc)["proxy_cost"]
-                    oracle_calls += 1
-                    if r_cost < _r_best: _r_best = r_cost; _r_pos = pos.copy()
-                    else: pos[ci, 0] = ox; pos[ci, 1] = oy; all_cx[ci] = ox; all_cy[ci] = oy
+                    if _fast_ok and _fast is not None:
+                        r_cost = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
+                        if r_cost < _r_best_fast: _r_best_fast = r_cost; _r_pos = pos.copy()
+                        else: pos[ci, 0] = ox; pos[ci, 1] = oy; all_cx[ci] = ox; all_cy[ci] = oy
+                    else:
+                        r_cost = compute_proxy_cost(torch.tensor(pos, dtype=torch.float32), benchmark, plc)["proxy_cost"]
+                        oracle_calls += 1
+                        if r_cost < _r_best: _r_best = r_cost; _r_pos = pos.copy()
+                        else: pos[ci, 0] = ox; pos[ci, 1] = oy; all_cx[ci] = ox; all_cy[ci] = oy
                 _r_micro = self._micro_legalize(torch.tensor(_r_pos, dtype=torch.float32), benchmark)
                 if compute_overlap_metrics(_r_micro, benchmark)["overlap_count"] == 0:
                     _ils_ok_count += 1
