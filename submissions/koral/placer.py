@@ -170,7 +170,7 @@ class KoralPlacer:
         target_density: float = 0.0,     # 0 = auto from utilization
         density_weight: float = 8e-5,
         gamma: float = 4.0,
-        sa_time_budget: int = int(os.environ.get("KORAL_SA_BUDGET", "3240")),  # 54min SA + ~3min DREAMPlace×3 = 57min total
+        sa_time_budget: int = int(os.environ.get("KORAL_SA_BUDGET", "3480")),  # 58min SA + ~1min DREAMPlace
         seed: int = 42,
     ):
         self.target_density  = target_density
@@ -220,28 +220,23 @@ class KoralPlacer:
             best_placement = ct_legal
             _n_mv_dp = sum(1 for i in range(benchmark.num_hard_macros) if not benchmark.macro_fixed[i])
 
-            # Multi-seed center-init DREAMPlace: try 3 seeds, keep best result.
-            # Center-init is stochastic (gp_noise_ratio=0.025) — some seeds give 1.01
-            # (beats CT 1.04 for ibm01) while others give 1.22 (much worse). Running 3
-            # seeds and keeping the minimum ensures consistent quality.
-            # Each run ~60s on GPU; 3 runs = 3min. sa_time_budget reduced to 3240s (54min)
-            # so total benchmark time stays ~57min, within the 1-hour judge limit.
-            _dp_seeds = [self.seed, self.seed + 17, self.seed + 37]
-            for _dp_seed in _dp_seeds:
-                try:
-                    dp = self._run_dreamplace(benchmark, center_init=True,
-                                              fix_soft=False, dp_seed=_dp_seed)
-                    dp = self._legalize_hard(dp, benchmark)
-                    if self._count_hard_overlaps_f32(dp, benchmark) == 0 and plc is not None:
-                        dp_cost = compute_proxy_cost(dp, benchmark, plc)["proxy_cost"]
-                        if dp_cost < best_dp_cost:
-                            print(f"  [start] DREAMPlace(s{_dp_seed}) {dp_cost:.4f} < best {best_dp_cost:.4f}")
-                            best_dp_cost = dp_cost
-                            best_placement = dp
-                        else:
-                            print(f"  [start] DREAMPlace(s{_dp_seed}) {dp_cost:.4f} >= best {best_dp_cost:.4f}")
-                except Exception as e:
-                    print(f"  [start] DREAMPlace(s{_dp_seed}) failed: {e}")
+            # Single-seed center-init DREAMPlace. Stochastic (gp_noise_ratio=0.025) —
+            # sometimes beats CT significantly (1.01 vs 1.04 for ibm01), sometimes not.
+            # If result has overlaps after legalization or is worse than CT, auto-discarded.
+            try:
+                dp = self._run_dreamplace(benchmark, center_init=True,
+                                          fix_soft=False, dp_seed=self.seed)
+                dp = self._legalize_hard(dp, benchmark)
+                if self._count_hard_overlaps_f32(dp, benchmark) == 0 and plc is not None:
+                    dp_cost = compute_proxy_cost(dp, benchmark, plc)["proxy_cost"]
+                    if dp_cost < best_dp_cost:
+                        print(f"  [start] DREAMPlace(center-init) {dp_cost:.4f} < best {best_dp_cost:.4f}")
+                        best_dp_cost = dp_cost
+                        best_placement = dp
+                    else:
+                        print(f"  [start] DREAMPlace(center-init) {dp_cost:.4f} >= best {best_dp_cost:.4f}")
+            except Exception as e:
+                print(f"  [start] DREAMPlace(center-init) failed: {e}")
 
             placement = best_placement
 
