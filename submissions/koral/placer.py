@@ -220,10 +220,11 @@ class KoralPlacer:
             best_placement = ct_legal
             _n_mv_dp = sum(1 for i in range(benchmark.num_hard_macros) if not benchmark.macro_fixed[i])
 
-            # ibm01 (246 macros): center-init finds global min (0.9221 vs CT 1.04); CT-init diverges.
-            # ibm02+ (259+ macros): CT-init warm start; center-init always diverges for these.
-            # Threshold 248 cleanly separates ibm01 (246) from ibm02 (259).
-            for _dp_center_init in ([True] if _n_mv_dp <= 248 else [False]):
+            # Always use center-init: DREAMPlace center-init consistently beats CT (1.01 vs 1.04
+            # for ibm01). CT-init creates 139-200 hard macro overlaps that legalization can't fix,
+            # giving worse results (1.60 vs CT 1.57 for ibm02). Center-init gives DREAMPlace a
+            # blank slate to find the global WL minimum without overlap artifacts from dense CT positions.
+            for _dp_center_init in ([True]):
                 _label = "center-init" if _dp_center_init else "CT-init"
                 try:
                     dp = self._run_dreamplace(benchmark, center_init=_dp_center_init,
@@ -401,7 +402,7 @@ class KoralPlacer:
                 "target_density":     target_density,
                 "density_weight":     self.density_weight,
                 "gamma":              self.gamma,
-                "macro_place_flag":   0,  # skip Hannan grid; global placement spreads macros first
+                "macro_place_flag":   0,
                 "legalize_flag":        0,
                 "abacus_legalize_flag": 0,
                 "detailed_place_flag":  0,
