@@ -259,16 +259,17 @@ class KoralPlacer:
             # Uses fork (Linux/Docker only) so workers inherit parent memory without pickling.
             # Falls back to sequential on Windows (spawn has import-path complexity).
             #
-            # CUDA + fork deadlock: PyTorch fork with active CUDA context deadlocks all workers
-            # on futex_wait_queue. Happens when Xplace/DREAMPlace used CUDA before fork.
-            # Fix: hide CUDA from workers by setting CUDA_VISIBLE_DEVICES="" before fork.
-            # Workers only use CPU oracle (plc.get_cost() is pure Python), so this is safe.
+            # CUDA + fork deadlock: forking after Xplace/DREAMPlace used CUDA leaves workers
+            # blocked on futex_wait_queue (background CUDA threads hold locks that the forked
+            # child processes inherit but can never acquire). Fix: use n_workers=1 (sequential,
+            # no fork) when CUDA was active. Sequential SA with full time budget from a good
+            # Xplace starting point is still highly effective.
             _cuda_was_active = torch.cuda.is_available()
-            if _cuda_was_active:
-                _orig_cuda_vis = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-                os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # hide GPU from forked workers
             n_workers = (min(4, os.cpu_count() or 1)
                          if sys.platform != 'win32' else 1)
+            if _cuda_was_active and n_workers > 1:
+                n_workers = 1
+                print("  [parallel-SA] CUDA was active → sequential SA (fork+CUDA deadlocks)")
             if n_workers > 1:
                 import multiprocessing as _mp
                 print(f"  [parallel-SA] {n_workers} workers, seeds {self.seed}..{self.seed+n_workers-1}")
@@ -311,13 +312,6 @@ class KoralPlacer:
                 for p in procs: p.join()
                 results = [result_q.get() for _ in procs]
 
-                # Restore CUDA after parallel SA (workers hid GPU)
-                if _cuda_was_active:
-                    if _orig_cuda_vis is None:
-                        os.environ.pop('CUDA_VISIBLE_DEVICES', None)
-                    else:
-                        os.environ['CUDA_VISIBLE_DEVICES'] = _orig_cuda_vis
-
                 best_cost, best_np = float('inf'), None
                 for res_np, cost in results:
                     if cost < best_cost:
@@ -326,12 +320,6 @@ class KoralPlacer:
                     placement = torch.from_numpy(best_np)
                 print(f"  [parallel-SA] best cost {best_cost:.4f}")
             else:
-                # Restore CUDA (sequential SA path)
-                if _cuda_was_active:
-                    if _orig_cuda_vis is None:
-                        os.environ.pop('CUDA_VISIBLE_DEVICES', None)
-                    else:
-                        os.environ['CUDA_VISIBLE_DEVICES'] = _orig_cuda_vis
                 placement = self._cd_lns_polish(placement, benchmark, plc)
 
         return placement
