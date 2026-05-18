@@ -9,36 +9,36 @@ sed -i \
   "s/print(int(torch.cuda.is_available()))/print(int(torch.version.cuda is not None))/" \
   "$SRC/cmake/TorchExtension.cmake"
 
-# Patch 2: Disable ONLY pin_pos_cuda_segment (CUB segmented-reduce, CUDA 12.4 incompatible).
-# Keep pin_pos_cuda enabled — it's needed for global placement and compiles fine without CUB.
-# Also disable k_reorder_cuda, global_swap_cuda, independent_set_matching_cuda (all CUB-based).
+# Patch 2: Disable CUB-based CUDA ops (CUDA 12.4 CUB API incompatible).
+# pin_pos_cuda and pin_pos_cuda_segment share the same if(TORCH_ENABLE_CUDA) block
+# in pin_pos/CMakeLists.txt, so disabling that block disables both. We accept CPU-only
+# for pin_pos and compensate with the Python-level stub in placer.py (which redirects
+# pin_pos_cuda imports to pin_pos_cpp at runtime).
+# k_reorder, global_swap, independent_set_matching each have their own cmake file.
 python3 -c "
 import re, sys
 
-def disable_target(cmake_path, target_name):
-    '''Disable cmake target by name without touching other targets in the same file.'''
+def disable_block(cmake_path, target_name):
+    '''Disable the TORCH_ENABLE_CUDA block containing target_name.'''
     content = open(cmake_path).read()
-    # Find if(TORCH_ENABLE_CUDA) blocks containing the target name and replace with if(FALSE)
-    # Split on 'if(TORCH_ENABLE_CUDA)' and check each block
     blocks = re.split(r'(?=if\s*\((?:TORCH_ENABLE_CUDA|torch_enable_cuda)\))', content)
     result = []
     for block in blocks:
-        if re.match(r'if\s*\((?:TORCH_ENABLE_CUDA|torch_enable_cuda)\)', block):
-            if target_name in block:
-                # Disable this block
-                block = re.sub(r'^if\s*\((?:TORCH_ENABLE_CUDA|torch_enable_cuda)\)',
-                               'if(FALSE) # koral: disabled (CUDA 12.4 CUB incompatible)', block, count=1)
-                print(f'  Disabled {target_name} in {cmake_path}')
+        if re.match(r'if\s*\((?:TORCH_ENABLE_CUDA|torch_enable_cuda)\)', block) and target_name in block:
+            block = re.sub(r'^if\s*\((?:TORCH_ENABLE_CUDA|torch_enable_cuda)\)',
+                           'if(FALSE) # koral: disabled (CUDA 12.4 CUB incompatible)', block, count=1)
+            print(f'  Disabled {target_name} in {cmake_path}')
         result.append(block)
     open(cmake_path, 'w').write(''.join(result))
 
 src = sys.argv[1]
-# pin_pos: disable ONLY pin_pos_cuda_segment (CUB-based), keep pin_pos_cuda
-disable_target(src + '/dreamplace/ops/pin_pos/CMakeLists.txt', 'pin_pos_cuda_segment')
-# These three are all CUB-based detailed-placement ops; disable completely
-disable_target(src + '/dreamplace/ops/k_reorder/CMakeLists.txt', 'k_reorder')
-disable_target(src + '/dreamplace/ops/global_swap/CMakeLists.txt', 'global_swap')
-disable_target(src + '/dreamplace/ops/independent_set_matching/CMakeLists.txt', 'independent_set_matching')
+# Disable the pin_pos CUDA block (includes both pin_pos_cuda and pin_pos_cuda_segment;
+# pin_pos_cpp CPU fallback is used at runtime via Python-level stub in placer.py)
+disable_block(src + '/dreamplace/ops/pin_pos/CMakeLists.txt', 'pin_pos_cuda_segment')
+# Detailed-placement ops (CUB-based, unused with detailed_place_flag=0)
+disable_block(src + '/dreamplace/ops/k_reorder/CMakeLists.txt', 'k_reorder')
+disable_block(src + '/dreamplace/ops/global_swap/CMakeLists.txt', 'global_swap')
+disable_block(src + '/dreamplace/ops/independent_set_matching/CMakeLists.txt', 'independent_set_matching')
 " "$SRC"
 
 # Patch 3: NumPy 2.0 compatibility — np.string_ removed, replaced by np.bytes_

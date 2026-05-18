@@ -124,6 +124,44 @@ def _dreamplace_available() -> bool:
         return False
 
 
+def _polish_worker(args):
+    """Module-level worker for parallel SA (fork context on Linux).
+
+    Reloads benchmark + plc from disk so each worker has its own independent
+    PlacementCost state. Returns (placement_np, proxy_cost).
+    """
+    bench_name, placement_np, sa_budget, seed = args
+    try:
+        from macro_place.loader import load_benchmark
+        base_ibm = "external/MacroPlacement/Testcases/ICCAD04/" + bench_name
+        netlist   = base_ibm + "/netlist.pb.txt"
+        plc_file  = base_ibm + "/initial.plc"
+        if not Path(netlist).exists():
+            ng45_map = {
+                "ariane133": "ariane133", "ariane136": "ariane136",
+                "nvdla": "nvdla", "mempool_tile": "mempool_tile",
+            }
+            ng45_name = ng45_map.get(bench_name)
+            if ng45_name:
+                base_ng  = ("external/MacroPlacement/Flows/NanGate45/"
+                            + ng45_name + "/netlist/output_CT_Grouping")
+                netlist  = base_ng + "/netlist.pb.txt"
+                plc_file = base_ng + "/initial.plc"
+        bench, plc = load_benchmark(
+            netlist, plc_file if Path(plc_file).exists() else None
+        )
+        placement = torch.from_numpy(placement_np).clone()
+        placer    = KoralPlacer(sa_time_budget=sa_budget, seed=seed)
+        result    = placer._cd_lns_polish(placement, bench, plc)
+        cost      = compute_proxy_cost(result, bench, plc)["proxy_cost"]
+        print(f"  [worker-s{seed}] done, cost={cost:.4f}", flush=True)
+        return result.numpy(), cost
+    except Exception as e:
+        import traceback
+        print(f"  [worker-s{seed}] ERROR: {e}\n{traceback.format_exc()}", flush=True)
+        return placement_np, float('inf')
+
+
 # ── Main placer ───────────────────────────────────────────────────────────────
 
 class KoralPlacer:
@@ -172,34 +210,72 @@ class KoralPlacer:
                         if not benchmark.macro_fixed[i])
 
         if _dreamplace_available():
-            # Try center-init DREAMPlace and keep result only if it beats CT.
-            # CPU-only mode (gpu=0) due to CUDA 12.4 pin_pos_cuda incompatibility in Docker build.
-            # ibm01 (246 movable macros) benefits significantly; ibm02-18 (271+) typically don't.
-            # Adaptive iterations control runtime: large benchmarks get fewer iterations (~1 min).
+            # Run DREAMPlace and keep result only if it beats CT — zero downside risk.
+            # CT-init (warm start): better for large benchmarks (ibm02-18) where center-init diverges.
+            # Center-init (random scatter): historically best for ibm01 (finds 0.9221 vs CT 1.04).
+            # Strategy: always try CT-init; also try center-init for small benchmarks (≤260 macros).
             ct_cost = compute_proxy_cost(ct_legal, benchmark, plc)["proxy_cost"] if plc else float('inf')
             best_dp_cost = ct_cost
             best_placement = ct_legal
+            _n_mv_dp = sum(1 for i in range(benchmark.num_hard_macros) if not benchmark.macro_fixed[i])
 
-            # Run center-init DREAMPlace (single seed — skip s2/CT-init to save time).
-            try:
-                dp = self._run_dreamplace(benchmark, center_init=True,
-                                          fix_soft=False, dp_seed=self.seed)
-                dp = self._legalize_hard(dp, benchmark)
-                if self._count_hard_overlaps_f32(dp, benchmark) == 0 and plc is not None:
-                    dp_cost = compute_proxy_cost(dp, benchmark, plc)["proxy_cost"]
-                    if dp_cost < best_dp_cost:
-                        print(f"  [start] DREAMPlace(center) {dp_cost:.4f} < best {best_dp_cost:.4f}")
-                        best_dp_cost = dp_cost
-                        best_placement = dp
-                    else:
-                        print(f"  [start] DREAMPlace(center) {dp_cost:.4f} >= best {best_dp_cost:.4f}")
-            except Exception as e:
-                print(f"  [start] DREAMPlace(center) failed: {e}")
+            for _dp_center_init in ([False, True] if _n_mv_dp <= 260 else [False]):
+                _label = "center-init" if _dp_center_init else "CT-init"
+                try:
+                    dp = self._run_dreamplace(benchmark, center_init=_dp_center_init,
+                                              fix_soft=False, dp_seed=self.seed)
+                    dp = self._legalize_hard(dp, benchmark)
+                    if self._count_hard_overlaps_f32(dp, benchmark) == 0 and plc is not None:
+                        dp_cost = compute_proxy_cost(dp, benchmark, plc)["proxy_cost"]
+                        if dp_cost < best_dp_cost:
+                            print(f"  [start] DREAMPlace({_label}) {dp_cost:.4f} < best {best_dp_cost:.4f}")
+                            best_dp_cost = dp_cost
+                            best_placement = dp
+                        else:
+                            print(f"  [start] DREAMPlace({_label}) {dp_cost:.4f} >= best {best_dp_cost:.4f}")
+                except Exception as e:
+                    print(f"  [start] DREAMPlace({_label}) failed: {e}")
 
             placement = best_placement
 
         if plc is not None and self.sa_time_budget > 0:
-            placement = self._cd_lns_polish(placement, benchmark, plc)
+            # Parallel SA: spawn N independent workers with different seeds, keep best result.
+            # Uses fork (Linux/Docker only) so workers inherit parent memory without pickling.
+            # Falls back to sequential on Windows (spawn has import-path complexity).
+            n_workers = (min(4, os.cpu_count() or 1)
+                         if sys.platform != 'win32' else 1)
+            if n_workers > 1:
+                import multiprocessing as _mp
+                print(f"  [parallel-SA] {n_workers} workers, seeds {self.seed}..{self.seed+n_workers-1}")
+                args_list = [
+                    (benchmark.name, placement.numpy().copy(), self.sa_time_budget, self.seed + i)
+                    for i in range(n_workers)
+                ]
+                ctx = _mp.get_context('fork')
+                result_q = ctx.Queue()
+
+                def _worker_fn(args):
+                    try:
+                        res = _polish_worker(args)
+                        result_q.put(res)
+                    except Exception as e:
+                        print(f"  [worker] error: {e}", flush=True)
+                        result_q.put((args[1], float('inf')))
+
+                procs = [ctx.Process(target=_worker_fn, args=(a,)) for a in args_list]
+                for p in procs: p.start()
+                for p in procs: p.join()
+                results = [result_q.get() for _ in procs]
+
+                best_cost, best_np = float('inf'), None
+                for res_np, cost in results:
+                    if cost < best_cost:
+                        best_cost, best_np = cost, res_np
+                if best_np is not None:
+                    placement = torch.from_numpy(best_np)
+                print(f"  [parallel-SA] best cost {best_cost:.4f}")
+            else:
+                placement = self._cd_lns_polish(placement, benchmark, plc)
 
         return placement
 
@@ -268,17 +344,30 @@ class KoralPlacer:
 
             aux_path = write_bookshelf(benchmark, tmpdir, fix_soft=fix_soft)
 
-            # Adaptive DREAMPlace iterations based on benchmark size.
-            # GPU CUDA ops incompatible with our Docker build (CUDA 12.4 CUB issue) → CPU only.
-            # CPU timing: <=50 macros ~5min, <=200 ~2min, >200 ~1min.
+            # Adaptive DREAMPlace iterations based on GPU availability.
+            # GPU: use CUDA when available. pin_pos_cuda compiles fine with CUDA 12.4;
+            # only pin_pos_cuda_segment + 3 detailed-place ops are disabled (CUB API compat).
+            # detailed_place_flag=0 so those disabled ops are never invoked.
             n_mv_hard = len(movable_hard)
-            _gpu = 0  # CPU mode (GPU pin_pos_cuda disabled at build time for CUDA 12.4 compat)
-            # ibm01 has ~246 movable macros; ibm02+ have 271+.
-            # Full 1000+1500 iterations for ≤260 macros (~3min on CPU, good quality for ibm01).
-            # 200+300 iterations for 260+ macros (~1min, ibm02+ usually discard DREAMPlace anyway).
-            if n_mv_hard > 260:
-                _iters1, _iters2 = 200, 300
+            # Use GPU only if CUDA is available AND the real pin_pos_cuda .so loaded.
+            # If pin_pos_cuda failed to import, our stub substitutes pin_pos_cpp (CPU).
+            # Calling a CPU op with GPU tensors (gpu=1 mode) causes a runtime crash.
+            _gpu = 0
+            if torch.cuda.is_available():
+                try:
+                    import dreamplace.ops.pin_pos.pin_pos_cuda as _ppc
+                    if getattr(_ppc, '__file__', None) is not None:
+                        _gpu = 1
+                except Exception:
+                    pass
+            if _gpu:
+                # GPU: fast enough for many iterations on all benchmark sizes.
+                _iters1, _iters2 = 2000, 3000
+            elif n_mv_hard > 260:
+                # CPU, large benchmark (ibm02+): keep modest to limit runtime.
+                _iters1, _iters2 = 500, 700
             else:
+                # CPU, small benchmark (ibm01): more iterations, good quality.
                 _iters1, _iters2 = 1000, 1500
 
             # Build DREAMPlace params
@@ -294,8 +383,8 @@ class KoralPlacer:
                 "detailed_place_flag":  0,
                 "global_place_flag":  1,
                 "enable_fillers":     1,
-                "stop_overflow":      0.07,
-                "gp_noise_ratio":     0.025,
+                "stop_overflow":      0.01,   # tight target: forces full iterations even for good CT-init
+                "gp_noise_ratio":     0.01,   # low noise: CT-init already near-optimal, refine don't perturb
                 "random_center_init_flag": 1 if center_init else 0,
                 "ignore_net_degree":  100,
                 "num_threads":        8,
@@ -330,7 +419,6 @@ class KoralPlacer:
             with open(params_path, "w") as f:
                 json.dump(params_dict, f)
 
-            # Run DREAMPlace in CPU mode
             params = Params.Params(); params.load(params_path)
             placedb = PlaceDB.PlaceDB(); placedb(params)
             placer = NonLinearPlace.NonLinearPlace(params, placedb, timer=None)
@@ -1253,14 +1341,14 @@ class KoralPlacer:
         # Cost: 2*fd_k oracle calls per gradient step + 1 verify ≈ 41 calls/step at k=20.
         oracle_time_est = max(0.5, (time.time() - (deadline - self.sa_time_budget)) / max(1, oracle_calls))
         fd_k = min(n_mv, 20)
-        # Run FD if at least 1 full step fits: fd_k * 2 probes + 1 verify + 2 buffer.
-        # Skip FD for congestion-dominated benchmarks (wl_frac < 4%): FD gradient is
-        # near-zero for congestion/density, and legalization inside FD is expensive on ibm06.
-        # ibm02 (4.77%) still runs FD which improved 2/7 steps; ibm06 (3.84%) skips it.
-        if deadline - time.time() > oracle_time_est * (fd_k * 2 + 3) and n_mv >= 1 and _wl_frac >= 0.04:
+        # Run FD for ALL benchmarks. For congestion-dominated (wl_frac < 4%), use larger
+        # probe distance (5% canvas) so position changes are large enough to perturb
+        # congestion grid bins and produce a non-zero gradient signal.
+        if deadline - time.time() > oracle_time_est * (fd_k * 2 + 3) and n_mv >= 1:
             _rebuild_state(best_pos, best_ori)
-            fd_delta_x = cw * 0.02
-            fd_delta_y = ch * 0.02
+            _fd_probe = 0.05 if _wl_frac < 0.04 else 0.02
+            fd_delta_x = cw * _fd_probe
+            fd_delta_y = ch * _fd_probe
             # Step size: scale with available room. For dense benchmarks (>75% utilization),
             # use smaller steps since macros are closely packed and large steps cause many
             # legalization passes. For sparse benchmarks, larger steps explore better.
