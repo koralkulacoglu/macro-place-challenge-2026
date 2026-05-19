@@ -2251,6 +2251,16 @@ class KoralPlacer:
             _cong_refresh_n = 2000  # refresh congestion map every N oSA steps
             _cong_last_refresh = -_cong_refresh_n  # force refresh on first iteration
 
+            # Oracle sync state: check oracle every ~20s; snap back when fast evaluator drifts.
+            # Root cause of prior failure: oSA ran 1-4M fast moves, found 300-800 "fast-best"
+            # updates, but every oracle check at the end failed (proxy drift outside calibration
+            # range). Fix: oracle every 20s + immediate check on >0.5% fast improvement.
+            # On oracle miss → snap pos back to oracle-confirmed best so drift can't accumulate.
+            _osa_last_oracle_t = time.time()
+            _osa_oracle_interval_s = 20.0  # oracle sync every 20s (~60s total overhead per 3600s)
+            _osa_oracle_best_fast = _fast_best if _use_fast_osa else float('inf')
+            _osa_oracle_syncs = 0; _osa_snap_backs = 0
+
             while time.time() < _osa_deadline:
                 # Adaptive scale: decay from base to 25% of base as time runs out
                 _t_frac = min(1.0, (time.time() - _osa_t0) / max(1e-9, _osa_deadline - _osa_t0))
@@ -2258,6 +2268,33 @@ class KoralPlacer:
                 # Temperature annealing: hot → cold over oSA budget.
                 # At t=0: T = _osa_T (initial). At t=1: T = 0.01 × _osa_T (near-greedy).
                 _osa_T_cur = _osa_T * max(0.01, 1.0 - 0.99 * _t_frac)
+
+                # ── Oracle sync: verify fast-best with oracle periodically ──────
+                # Trigger on: (a) time interval OR (b) fast improved >0.5% vs oracle baseline.
+                # On oracle miss: snap back so fast evaluator re-anchors to a valid region.
+                if _use_fast_osa and _osa_tries > 0:
+                    _fast_impr = (_osa_oracle_best_fast - _fast_best) / max(1e-9, abs(_osa_oracle_best_fast))
+                    _t_since   = time.time() - _osa_last_oracle_t
+                    if _t_since >= _osa_oracle_interval_s or _fast_impr > 0.005:
+                        _oc = compute_proxy_cost(
+                            torch.tensor(_fast_best_pos, dtype=torch.float32), benchmark, plc
+                        )["proxy_cost"]
+                        oracle_calls += 1; _osa_oracle_syncs += 1
+                        _osa_last_oracle_t = time.time()
+                        if _oc < best_cost:
+                            best_cost = _oc; best_pos = _fast_best_pos.copy(); best_ori = ori.copy()
+                            _osa_oracle_best_fast = _fast_best
+                            _osa_improved += 1
+                            print(f"  [oSA oracle] t={time.time()-_osa_t0:.0f}s  "
+                                  f"oracle_best={_oc:.4f}  fast={_fast_best:.4f}")
+                        else:
+                            # Fast evaluator drifted — snap back to oracle-confirmed best
+                            pos[:] = best_pos
+                            all_cx[:n_mac] = pos[:n_mac, 0]; all_cy[:n_mac] = pos[:n_mac, 1]
+                            _fast_cur = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
+                            _fast_best = _fast_cur; _fast_best_pos = pos.copy()
+                            _osa_oracle_best_fast = _fast_cur
+                            _osa_snap_backs += 1
 
                 # Refresh congestion map periodically when fast evaluator available.
                 # Used to select macros biased toward congested regions (10% of moves).
@@ -2398,26 +2435,17 @@ class KoralPlacer:
                     pos[ci, 0] = old_x; pos[ci, 1] = old_y
                     all_cx[ci] = old_x; all_cy[ci] = old_y
 
-            # ── After fast oSA: oracle verify best candidate ──────────────────
+            # ── After fast oSA: best_pos is already oracle-verified (ongoing syncs) ─
             if _use_fast_osa:
-                # Use fast-best position; verify with oracle
-                pos[:] = _fast_best_pos; ori[:] = best_ori
+                # Restore pos to oracle-confirmed best (fast moves may have left pos elsewhere)
+                pos[:] = best_pos; ori[:] = best_ori
                 all_cx[:n_mac] = pos[:n_mac, 0]; all_cy[:n_mac] = pos[:n_mac, 1]
-                _osa_oracle_cost = compute_proxy_cost(
-                    torch.tensor(pos, dtype=torch.float32), benchmark, plc
-                )["proxy_cost"]
-                oracle_calls += 1
-                print(f"  [oSA] {_osa_tries} fast moves, {_osa_improved} fast-best updates; "
-                      f"oracle={_osa_oracle_cost:.4f} vs pre-oSA={_pre_osa_best_cost:.4f}")
-                if _osa_oracle_cost < _pre_osa_best_cost:
-                    best_cost = _osa_oracle_cost; best_pos = pos.copy(); best_ori = ori.copy()
-                    _osa_improved_verified = True
-                else:
-                    pos[:] = _pre_osa_best_pos; ori[:] = best_ori
-                    all_cx[:n_mac] = pos[:n_mac, 0]; all_cy[:n_mac] = pos[:n_mac, 1]
-                    best_pos = _pre_osa_best_pos; best_cost = _pre_osa_best_cost
-                    _osa_improved_verified = False
-                    print(f"  [oSA] reverted: fast-best not oracle-confirmed")
+                _osa_improved_verified = best_cost < _pre_osa_best_cost
+                print(f"  [oSA] {_osa_tries} fast moves, {_osa_improved} oracle-confirmed improvements, "
+                      f"{_osa_oracle_syncs} syncs, {_osa_snap_backs} snap-backs; "
+                      f"best={best_cost:.4f} vs pre-oSA={_pre_osa_best_cost:.4f}")
+                if not _osa_improved_verified:
+                    print(f"  [oSA] no oracle-confirmed improvement over pre-oSA baseline")
             else:
                 _osa_improved_verified = _osa_improved > 0
                 if _osa_improved > 0 or _osa_accepted > 5:

@@ -14,7 +14,7 @@ KoralPlacer uses a three-stage pipeline:
 
 The key insight: all IBM benchmarks are congestion-dominated (WL accounts for only 4–6% of proxy cost). Reducing density and congestion hotspots requires a good global macro arrangement — CT positions alone are insufficient. Xplace's electrostatic placement with routability awareness directly reduces density, cutting it 10–23% vs CT across all 17 benchmarks.
 
-**Critical finding (May 19):** The SA currently contributes ~0 improvement over Xplace GP — the fast evaluator drifts outside its calibration range during oSA, producing phantom improvements that the oracle rejects. The final score equals the Xplace GP score. Active work: multi-fidelity seed search + oSA oracle sync fix.
+**Critical finding (May 19):** The SA originally contributed ~0 improvement over Xplace GP — the fast evaluator drifted outside its calibration range during oSA, producing phantom improvements that the oracle rejected. Fixes applied: (1) multi-fidelity Xplace seed search (100-200 coarse → top-10 full GP → top-3 warm SA), (2) oSA oracle sync every 20s with snap-back on proxy drift.
 
 ---
 

@@ -7,7 +7,7 @@
 - **Branch**: `strategy-may18`
 - **Key discovery**: SA contributes ~0 improvement — fast evaluator drifts in oSA, all candidates oracle-rejected
 - **Completed runs**: ibm01=0.9099, ibm03=1.1758, ibm04=1.1106, ibm06=1.4099, ibm09=0.9506 (all = Xplace GP score)
-- **Active work**: `TimeBudget` + multi-fidelity Xplace seed search + oSA oracle sync fix
+- **Active work**: Docker validation of all 3 fixes together (needs GPU)
 
 ---
 
