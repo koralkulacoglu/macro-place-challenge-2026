@@ -44,11 +44,11 @@ Any benchmark with a hard macro overlap → disqualified entirely.
 
 **Key baselines to beat:**
 - SA baseline avg: ~2.13
-- RePlAce baseline avg: ~1.46 (the real target — harder to beat)
-- Leaderboard rank 1: 0.9671 (Carrotato — Triton+Xplace)
+- RePlAce baseline avg: ~1.46 (the competition's reference baseline)
+- Leaderboard rank 1: 0.9671 avg (Carrotato — Triton+Xplace+congestion-aware GP)
 - Leaderboard rank 5: 1.037 (Cezar)
 - Leaderboard rank 10: 1.1764 (KLA MACH — DREAMPlace+CD+SA+ILS)
-- Estimated our current: ~1.45–1.55 (~rank 35–45)
+- Estimated our current: ~1.10–1.20 (~rank 15–25 est.)
 
 ## Architecture
 
@@ -120,64 +120,59 @@ If you have non-standard deps, include a `Dockerfile` in your submission. Otherw
 
 ## Our Submission: `submissions/koral/`
 
-CT positions + parallel SA + ibm06 cascade fix. DREAMPlace is included but broken in the current Docker image — see HANDOFF.md for full details.
+CT positions → Xplace multi-seed GP → sequential SA. DREAMPlace has been removed.
 
-**Pipeline (git: 5a31474, full run in progress):**
-1. CT positions → legalize → proxy eval (baseline ~1.04–1.57 per benchmark)
-2. DREAMPlace center-init (stochastic; ~25% chance of beating CT; auto-discarded if worse)
-3. Best of (CT, DREAMPlace) → 4 parallel SA workers (seeds 42–45)
-   - Perturbation: 0%, 1.5%, 3%, 4.5% Gaussian noise (σ = fraction of canvas)
-4. `_cd_lns_polish` (3480s budget per worker):
-   - CD → LNS → FD → hSA (65% translate, 15% rotate, 20% swap)
-   - Oracle SA tail: 70% translate, 30% swap (NEW: swap moves added May 18)
-5. Best worker result used as final placement
+**Pipeline (git head: f7acf29):**
+1. CT positions (from initial.plc)
+2. Xplace multi-seed GP (6 seeds × ~6s = ~36s, bookshelf format)
+   - `stop_overflow=0.05`, `inner_iter=8000`, `mixed_size=True`
+   - Noise schedule: [0.005, 0.025, 0.05, 0.10, 0.15, 0.20]
+   - Best seed selected by oracle cost after legalization
+3. `_legalize_hard` (greedy micro-legalization)
+4. Sequential SA (3480s): CD → LNS → FD → hSA → oSA
+   - n_workers=1 (parallel SA deadlocks due to CUDA+fork)
+   - FastEvaluator: 383x speedup for SA decisions
 
-**Key empirical findings (verified May 2026):**
-- DREAMPlace (current Docker, May 2026 version): unreliable. center-init gives 1.01–1.23 (vs CT 1.04) stochastically. CT-init creates 139-200 hard macro overlaps → always discarded. OLD DREAMPlace gave ibm01=0.9197 reliably. FIX: pin Docker to pre-entropy-injection commit.
-- ibm06: CT has 47 sub-4nm overlaps → cascade in micro_legalize. Perturbed workers at 3-4.5% sigma escape → 1.6877 (was 1.8343). This is the biggest SA improvement.
-- Swap moves (30% in oracle SA): just added, unverified improvement. Should help WL-dominated.
-- k_osa_max=1 is critical — cluster moves have <5% validity rate on dense benchmarks.
-- LNS: 0.001–0.003 improvement for WL-dominated benchmarks.
+**Verified scores (measured 2026-05-19 in Docker):**
+- ibm01: 0.908 after Xplace GP+legalization (before SA); ~0.89 after full SA
+- Xplace GP avg across 17 benchmarks: ~1.25
+- After SA avg: ~1.10–1.20 (estimated)
 
-**Best verified scores (May 2026):**
-- ibm01: 0.9197 (old DREAMPlace, first session) / ~1.03 (current, CT+SA)
-- ibm02: 1.5476 (CT+SA)
-- ibm06: 1.6877 (perturbed SA cascade escape)
-- ibm09: 1.1126
-- Average (all 17, old baseline): 1.457
-- Average (estimated, current): ~1.42–1.45
-
-**Leaderboard position (estimated):** ~rank 30–40. Target: top 5 (need ~1.04).
-**Critical gap:** analytical placement. Fix DREAMPlace version OR integrate Xplace.
-See HANDOFF.md for all next steps.
+**Key empirical facts:**
+- `stop_overflow=0.01` crashes Xplace's LP macro legalization (PulpError: NaN/inf). Use 0.05.
+- `use_route_force=True` crashes Xplace's GPU pattern router for IBM benchmarks (1.8M route segments overflow kernel buffer). Do not attempt.
+- Parallel SA deadlocks when CUDA is active (CUDA+fork futex issue) → n_workers=1 always.
+- Xplace GP optimizes WL+Density only. Congestion (~40% of proxy cost) is NOT reduced during GP. This is the main gap vs rank 1.
+- ibm02 and ibm18 barely improve with Xplace (−0.9% and −1.5%) — root cause unknown.
 
 **Key files:**
-- `submissions/koral/placer.py` — `KoralPlacer` class (~1291 lines)
-- `submissions/koral/bookshelf.py` — Benchmark → DREAMPlace Bookshelf adapter
-- `submissions/koral/Dockerfile` — clones DREAMPlace at build time, applies CUDA 12.4 patches
-- `submissions/koral/patch_dreamplace.sh` — CUDA 12.4 + NumPy 2.0 compat patches
-- `HANDOFF.md` — full strategic context, leaderboard analysis, implementation plans
+- `submissions/koral/placer.py` — `KoralPlacer` class (~1300 lines)
+- `submissions/koral/bookshelf.py` — Benchmark → ISPD2005 bookshelf for Xplace
+- `submissions/koral/fast_eval.py` — FastEvaluator (383x SA speedup)
+- `submissions/koral/Dockerfile` — Docker: Xplace + dependencies
+- `HANDOFF.md` — detailed state, investigation results, next steps
 
-**Docker build:** Clones DREAMPlace from GitHub at build time. `--network none` is runtime only.
-
-**CUDA 12.4 compatibility patches (applied by patch_dreamplace.sh at Docker build):**
-- `cmake/TorchExtension.cmake`: detect CUDA via `torch.version.cuda` not `is_available()`
-- `libcuda.so` stub symlinked for cmake's `find_package(CUDA)` during build
-- 4 CUDA targets disabled: `pin_pos_cuda_segment`, `k_reorder_cuda`, `global_swap_cuda`, `independent_set_matching_cuda` (CUB API incompatible with CUDA 12.4; all are detailed-placement ops, unused with `detailed_place_flag=0`)
-- `PlaceDB.py`: `np.string_` → `np.bytes_` (NumPy 2.0)
-
-**Dev loop:**
+**Dev loop (Docker — new files need `docker cp`, bind mount doesn't see them):**
 ```bash
-# Build Docker image (clones + compiles DREAMPlace, ~40 min first time)
-docker build -t koral-placer -f submissions/koral/Dockerfile .
+# Build image (Xplace, ~40 min first time)
+docker build -t koral-placer-xplace -f submissions/koral/Dockerfile .
 
-# Run with live repo bind-mount + GPU (ibm01 needs DREAMPlace = needs Docker)
-docker run --rm --runtime=nvidia --gpus all -v $(pwd):/challenge \
-  --network none --entrypoint python koral-placer \
-  -m macro_place.evaluate submissions/koral/placer.py -b ibm01
+# Start container for testing
+docker run -d --runtime=nvidia --gpus all \
+  -v "C:/path/to/repo:/challenge" --network none \
+  --name test_xplace --entrypoint=bash koral-placer-xplace -c "sleep 3600"
 
-# ibm02-18: no DREAMPlace needed, run locally
-nohup timeout 620 uv run evaluate submissions/koral/placer.py -b ibm02 > /tmp/ibm02.log 2>&1 &
+# Copy updated files (required — bind mount only shows build-time copies)
+docker cp submissions/koral/placer.py test_xplace:/challenge/submissions/koral/placer.py
+
+# Run test
+docker exec test_xplace bash -c \
+  "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py -b ibm01"
+
+# Full submission run
+docker run --rm --runtime=nvidia --gpus all \
+  -v "C:/path/to/repo:/challenge" --network none \
+  koral-placer-xplace submissions/koral/placer.py --all
 ```
 
 ## Reproducibility Warning
