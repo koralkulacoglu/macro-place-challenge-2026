@@ -3,8 +3,7 @@
 # Pipeline: Xplace multi-seed GP (top-16 seeds) → 16 parallel SA workers
 # Requires: CUDA GPU at runtime (Xplace uses GPU for routability-driven GP)
 #
-# ── Build (from repo root, submodule must be initialized) ─────────────────
-#   git submodule update --init external/MacroPlacement
+# ── Build (from repo root) ────────────────────────────────────────────────
 #   docker build -t koral-placer -f submissions/koral/Dockerfile .
 #
 # ── Run a single benchmark ────────────────────────────────────────────────
@@ -76,13 +75,10 @@ RUN sed -i 's/np\.round_/np.round/g'    /opt/xplace/src/core/macro_legalization.
 ENV XPLACE_HOME=/opt/xplace
 ENV PYTHONPATH=/opt/xplace
 
-# ── Benchmarks (baked in; judges may also bind-mount their own copy) ──────
-COPY external/MacroPlacement/Testcases/ICCAD04 \
-     /challenge/external/MacroPlacement/Testcases/ICCAD04
-COPY external/MacroPlacement/CodeElements/Plc_client \
-     /challenge/external/MacroPlacement/CodeElements/Plc_client
-
 # ── Submission code ───────────────────────────────────────────────────────
+# Benchmarks are NOT baked in — provided at runtime via bind mount (-v).
+# The run commands above mount the challenge repo root as /challenge,
+# which gives the container access to external/MacroPlacement/Testcases/.
 RUN mkdir -p /challenge/submissions/koral
 COPY submissions/koral/placer.py    /challenge/submissions/koral/placer.py
 COPY submissions/koral/bookshelf.py /challenge/submissions/koral/bookshelf.py
