@@ -377,7 +377,8 @@ class KoralPlacer:
     def _xplace_run_one(self, benchmark: Benchmark, tmpdir: str, aux_path: str,
                         xplace_home: str, xplace_main: str, target_density: float,
                         seed: int, inner_iter: int,
-                        use_route_force: bool = False) -> "tuple[torch.Tensor | None, float]":
+                        noise_ratio: float = 0.025, stop_overflow: float = 0.01,
+                        use_route_force: bool = True) -> "tuple[torch.Tensor | None, float]":
         """Run one Xplace GP. Returns (positions, elapsed_seconds) or (None, elapsed)."""
         import subprocess, glob as _glob
         result_dir  = os.path.join(tmpdir, f"results_s{seed}")
@@ -398,9 +399,9 @@ class KoralPlacer:
             "--write_global_placement","True",
             "--inner_iter",            str(inner_iter),
             "--use_filler",            "False",
-            "--noise_ratio",           "0.025",
+            "--noise_ratio",           str(noise_ratio),
             "--target_density",        str(target_density),
-            "--stop_overflow",         "0.05",
+            "--stop_overflow",         str(stop_overflow),
             "--mixed_size",            "True",
             "--gpu",                   "0",
             "--num_threads",           "8",
@@ -523,90 +524,57 @@ class KoralPlacer:
         try:
             aux_path = write_bookshelf(benchmark, tmpdir, fix_soft=False)
 
-            # ── Phase A: coarse seed sweep ────────────────────────────────────
-            phase_A_budget = budget.allocate(0.35, max_seconds=600)
-            budget.log("Xplace A start", f"budget={phase_A_budget:.0f}s  up_to_200_seeds  "
-                       f"inner_iter=500")
-            phase_A_t0  = time.time()
-            coarse_results = []  # list of (fast_cost, seed, pos)
+            # ── Multi-seed GP sweep (inner_iter=5000, proven to converge) ────
+            # Phase A (inner_iter=500) was dropped: partial convergence produces
+            # hard-macro overlaps that legalization can't resolve, wasting the
+            # entire phase budget with zero usable seeds.
+            # 8000 iterations: enough for dense benchmarks to converge; stop_overflow=0.05
+            # terminates early for small/easy benchmarks so extra iters cost nothing.
+            # noise_ratio schedule: coarse → scattered, cycling through on repeat
+            # Gives genuine macro arrangement diversity beyond just RNG seed variation.
+            _noise_sched = [0.005, 0.025, 0.05, 0.10, 0.15, 0.20]
+            seed_budget = budget.allocate(0.40, max_seconds=700)
+            budget.log("Xplace seeds start", f"budget={seed_budget:.0f}s  "
+                       f"budget-governed  inner_iter=8000  route_force=True")
+            seed_t0      = time.time()
+            full_results = []  # list of (oracle_cost, seed, pos)
 
-            for seed_idx in range(200):
-                if time.time() - phase_A_t0 >= phase_A_budget:
+            for seed_idx in range(100):   # budget governs actual count
+                if time.time() - seed_t0 >= seed_budget:
                     break
-                seed = self.seed + seed_idx
+                seed    = self.seed + seed_idx
+                noise_r = _noise_sched[seed_idx % len(_noise_sched)]
                 pos, elapsed = self._xplace_run_one(
                     benchmark, tmpdir, aux_path, xplace_home, xplace_main,
-                    target_density, seed=seed, inner_iter=500,
+                    target_density, seed=seed, inner_iter=8000, noise_ratio=noise_r,
+                    # stop_overflow=0.01, use_route_force=True are the new defaults
                 )
                 if pos is None:
                     if seed_idx == 0:
-                        print(f"  [Xplace A] first seed failed — Xplace not working, aborting")
+                        print(f"  [Xplace] first seed failed — aborting")
                         return None
                     continue
                 pos = self._legalize_hard(pos, benchmark)
                 if self._count_hard_overlaps_f32(pos, benchmark) > 0:
                     continue
-                fast_cost = float(fast.evaluate(pos)) if fast is not None else float('inf')
-                is_best   = (not coarse_results) or fast_cost < coarse_results[0][0]
-                coarse_results.append((fast_cost, seed, pos))
-                coarse_results.sort(key=lambda x: x[0])
-                print(f"  [Xplace A] seed={seed} fast={fast_cost:.4f} {elapsed:.0f}s"
-                      f"  ({len(coarse_results)} ok)" + ("  ← new best!" if is_best else ""))
-
-            if not coarse_results:
-                print("  [Xplace A] no valid coarse results")
-                return None
-            budget.log("Xplace A done", f"seeds={len(coarse_results)}  "
-                       f"best_fast={coarse_results[0][0]:.4f}  "
-                       f"worst_fast={coarse_results[-1][0]:.4f}")
-
-            # ── Phase B: full GP on top-10 coarse winners ─────────────────────
-            phase_B_budget = budget.allocate(0.18, max_seconds=600)
-            top_coarse     = coarse_results[:min(10, len(coarse_results))]
-            budget.log("Xplace B start", f"budget={phase_B_budget:.0f}s  "
-                       f"full_GP on top_{len(top_coarse)}_seeds  inner_iter=5000")
-            phase_B_t0  = time.time()
-            full_results = []  # list of (oracle_cost, seed, pos)
-
-            for fast_cost_c, seed, pos_coarse in top_coarse:
-                time_left_B = phase_B_budget - (time.time() - phase_B_t0)
-                if time_left_B < 20:
-                    # No time for full GP; use coarse result with oracle eval
-                    if plc is not None:
-                        oc = compute_proxy_cost(pos_coarse, benchmark, plc)["proxy_cost"]
-                    else:
-                        oc = fast_cost_c
-                    full_results.append((oc, seed, pos_coarse))
-                    print(f"  [Xplace B] seed={seed} time up, using coarse oracle={oc:.4f}")
-                    continue
-                pos, elapsed = self._xplace_run_one(
-                    benchmark, tmpdir, aux_path, xplace_home, xplace_main,
-                    target_density, seed=seed, inner_iter=5000,
-                )
-                if pos is None:
-                    pos = pos_coarse  # fall back to coarse result
-                pos = self._legalize_hard(pos, benchmark)
-                if self._count_hard_overlaps_f32(pos, benchmark) > 0:
-                    continue
-                oc = compute_proxy_cost(pos, benchmark, plc)["proxy_cost"] if plc else fast_cost_c
+                oc      = compute_proxy_cost(pos, benchmark, plc)["proxy_cost"] if plc else float('inf')
                 is_best = (not full_results) or oc < full_results[0][0]
                 full_results.append((oc, seed, pos))
                 full_results.sort(key=lambda x: x[0])
-                print(f"  [Xplace B] seed={seed} oracle={oc:.4f} (coarse_fast={fast_cost_c:.4f})"
-                      f" {elapsed:.0f}s" + ("  ← new best!" if is_best else ""))
+                print(f"  [Xplace] seed={seed} noise={noise_r} oracle={oc:.4f} {elapsed:.0f}s"
+                      f"  ({len(full_results)} ok)" + ("  ← new best!" if is_best else ""))
 
             if not full_results:
-                print("  [Xplace B] no valid full results, using best coarse")
-                fc, fs, fp = coarse_results[0]
-                return fp
-            budget.log("Xplace B done", f"seeds={len(full_results)}  "
-                       f"best_oracle={full_results[0][0]:.4f}")
+                print("  [Xplace] no valid seeds")
+                return None
+            budget.log("Xplace seeds done", f"n={len(full_results)}  "
+                       f"best={full_results[0][0]:.4f}  worst={full_results[-1][0]:.4f}")
 
-            # ── Phase C: warm oracle SA on top-3 ─────────────────────────────
+            # ── Warm oracle SA on top-3 seeds (basin quality check) ──────────
             phase_C_budget = budget.allocate(0.22, max_seconds=1000)
             top_full       = full_results[:min(3, len(full_results))]
             warm_per_seed  = max(20.0, phase_C_budget / len(top_full))
-            budget.log("Xplace C start", f"budget={phase_C_budget:.0f}s  "
+            budget.log("Xplace warmSA start", f"budget={phase_C_budget:.0f}s  "
                        f"{warm_per_seed:.0f}s/seed  top_{len(top_full)}")
             warm_results = []  # list of (warm_cost, seed, warm_pos)
 
@@ -625,7 +593,7 @@ class KoralPlacer:
 
             warm_results.sort(key=lambda x: x[0])
             best_cost, best_seed, best_pos = warm_results[0]
-            budget.log("Xplace C done", f"winner_seed={best_seed}  best={best_cost:.4f}")
+            budget.log("Xplace warmSA done", f"winner_seed={best_seed}  best={best_cost:.4f}")
             return best_pos
 
         finally:
