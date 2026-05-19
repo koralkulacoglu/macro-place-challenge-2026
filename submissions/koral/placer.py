@@ -526,7 +526,7 @@ class KoralPlacer:
             aux_path = write_bookshelf(benchmark, tmpdir, fix_soft=False)
 
             # ── Phase A: coarse seed sweep ────────────────────────────────────
-            phase_A_budget = budget.allocate(0.25, max_seconds=1000)
+            phase_A_budget = budget.allocate(0.35, max_seconds=600)
             budget.log("Xplace A start", f"budget={phase_A_budget:.0f}s  up_to_200_seeds  "
                        f"inner_iter=500")
             phase_A_t0  = time.time()
@@ -538,9 +538,13 @@ class KoralPlacer:
                     break
                 seed     = self.seed + seed_idx
                 time_left_A = phase_A_budget - (time.time() - phase_A_t0)
-                # First seed gets a long timeout for CUDA JIT warm-up (can take 60-120s).
-                # Subsequent seeds use an adaptive estimate based on observed timing × 1.5.
-                _seed_timeout = min(_xpl_time_est * 1.5, max(30.0, time_left_A))
+                # First seed: fixed 200s timeout independent of phase budget.
+                # CUDA JIT compilation on first run takes 60-120s; can't be capped by budget.
+                # Subsequent seeds: adaptive estimate × 1.5, capped by remaining time.
+                if seed_idx == 0:
+                    _seed_timeout = 200.0
+                else:
+                    _seed_timeout = min(_xpl_time_est * 1.5, max(30.0, time_left_A))
                 pos, elapsed = self._xplace_run_one(
                     benchmark, tmpdir, aux_path, xplace_home, xplace_main,
                     target_density, seed=seed, inner_iter=500,
