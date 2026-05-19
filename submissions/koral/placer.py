@@ -287,16 +287,27 @@ class KoralPlacer:
 
             if n_workers > 1:
                 import multiprocessing as _mp
-                print(f"  [parallel-SA] {n_workers} workers, spawn context")
-                ctx = _mp.get_context('spawn')
+                # Synchronize CUDA before fork so no locks are held at fork time.
+                # Workers are CPU-only (load fresh benchmark from disk, no CUDA ops),
+                # so fork is safe as long as CUDA is idle.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                print(f"  [parallel-SA] {n_workers} workers, fork context")
+                ctx = _mp.get_context('fork')
                 result_q = ctx.Queue()
+
+                def _worker_fn(args):
+                    try:
+                        result_q.put(_polish_worker(args))
+                    except Exception as e:
+                        result_q.put((args[1], float('inf')))
 
                 args_list = [
                     (benchmark.name, pos_np, sa_budget, self.seed + i)
                     for i, pos_np in enumerate(_start_positions)
                 ]
-                procs = [ctx.Process(target=_polish_worker_queued, args=(result_q, a))
-                         for a in args_list]
+                procs = [ctx.Process(target=_worker_fn, args=(a,)) for a in args_list]
                 for p in procs: p.start()
                 for p in procs: p.join()
                 results = [result_q.get() for _ in procs]
