@@ -88,6 +88,14 @@ class _WorkerStream:
     def reconfigure(self, **kw): pass
 
 
+def _polish_worker_queued(q, args):
+    """Module-level wrapper so spawn context can pickle the target."""
+    try:
+        q.put(_polish_worker(args))
+    except Exception as e:
+        q.put((args[1], float('inf')))
+
+
 def _polish_worker(args):
     """Module-level worker for parallel SA (spawn context).
 
@@ -283,17 +291,12 @@ class KoralPlacer:
                 ctx = _mp.get_context('spawn')
                 result_q = ctx.Queue()
 
-                def _worker_fn(args):
-                    try:
-                        result_q.put(_polish_worker(args))
-                    except Exception as e:
-                        result_q.put((args[1], float('inf')))
-
                 args_list = [
                     (benchmark.name, pos_np, sa_budget, self.seed + i)
                     for i, pos_np in enumerate(_start_positions)
                 ]
-                procs = [ctx.Process(target=_worker_fn, args=(a,)) for a in args_list]
+                procs = [ctx.Process(target=_polish_worker_queued, args=(result_q, a))
+                         for a in args_list]
                 for p in procs: p.start()
                 for p in procs: p.join()
                 results = [result_q.get() for _ in procs]
