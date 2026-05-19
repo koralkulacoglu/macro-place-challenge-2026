@@ -376,7 +376,7 @@ class KoralPlacer:
 
     def _xplace_run_one(self, benchmark: Benchmark, tmpdir: str, aux_path: str,
                         xplace_home: str, xplace_main: str, target_density: float,
-                        seed: int, inner_iter: int, timeout: float,
+                        seed: int, inner_iter: int,
                         use_route_force: bool = False) -> "tuple[torch.Tensor | None, float]":
         """Run one Xplace GP. Returns (positions, elapsed_seconds) or (None, elapsed)."""
         import subprocess, glob as _glob
@@ -418,7 +418,7 @@ class KoralPlacer:
         t0 = time.time()
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout,
+                cmd, capture_output=True, text=True,
                 cwd=xplace_home,
                 env={**os.environ, "PYTHONPATH": f"{xplace_home}:{os.environ.get('PYTHONPATH', '')}"}
             )
@@ -427,8 +427,6 @@ class KoralPlacer:
                 tail = (proc.stdout or "")[-400:] + (proc.stderr or "")[-200:]
                 print(f"  [Xplace] seed={seed} failed rc={proc.returncode} in {elapsed:.0f}s: {tail[-100:]}")
                 return None, elapsed
-        except subprocess.TimeoutExpired:
-            return None, float(timeout)
         except Exception as e:
             return None, time.time() - t0
 
@@ -531,24 +529,14 @@ class KoralPlacer:
                        f"inner_iter=500")
             phase_A_t0  = time.time()
             coarse_results = []  # list of (fast_cost, seed, pos)
-            _xpl_time_est = 180.0  # adaptive estimate; starts high for CUDA JIT cold-start
 
             for seed_idx in range(200):
                 if time.time() - phase_A_t0 >= phase_A_budget:
                     break
-                seed     = self.seed + seed_idx
-                time_left_A = phase_A_budget - (time.time() - phase_A_t0)
-                # First seed: fixed 200s timeout independent of phase budget.
-                # CUDA JIT compilation on first run takes 60-120s; can't be capped by budget.
-                # Subsequent seeds: adaptive estimate × 1.5, capped by remaining time.
-                if seed_idx == 0:
-                    _seed_timeout = 200.0
-                else:
-                    _seed_timeout = min(_xpl_time_est * 1.5, max(30.0, time_left_A))
+                seed = self.seed + seed_idx
                 pos, elapsed = self._xplace_run_one(
                     benchmark, tmpdir, aux_path, xplace_home, xplace_main,
                     target_density, seed=seed, inner_iter=500,
-                    timeout=_seed_timeout
                 )
                 if pos is None:
                     if seed_idx == 0:
@@ -558,11 +546,6 @@ class KoralPlacer:
                 pos = self._legalize_hard(pos, benchmark)
                 if self._count_hard_overlaps_f32(pos, benchmark) > 0:
                     continue
-                # Update timing estimate for adaptive timeout (EMA after first success)
-                if coarse_results:
-                    _xpl_time_est = 0.6 * _xpl_time_est + 0.4 * elapsed
-                else:
-                    _xpl_time_est = elapsed  # first success: set directly
                 fast_cost = float(fast.evaluate(pos)) if fast is not None else float('inf')
                 is_best   = (not coarse_results) or fast_cost < coarse_results[0][0]
                 coarse_results.append((fast_cost, seed, pos))
@@ -599,7 +582,6 @@ class KoralPlacer:
                 pos, elapsed = self._xplace_run_one(
                     benchmark, tmpdir, aux_path, xplace_home, xplace_main,
                     target_density, seed=seed, inner_iter=5000,
-                    timeout=min(180.0, time_left_B + 5)
                 )
                 if pos is None:
                     pos = pos_coarse  # fall back to coarse result
