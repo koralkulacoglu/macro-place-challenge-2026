@@ -30,7 +30,7 @@ SHELL ["/bin/bash", "-c"]
 
 # ── System build dependencies ─────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake bison flex libfl-dev libboost-all-dev \
+        cmake bison flex libfl-dev libboost-all-dev libcairo2-dev \
         build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
