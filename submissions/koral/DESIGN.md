@@ -23,29 +23,33 @@ The key insight: all IBM benchmarks are congestion-dominated (WL accounts for on
 ```
 CT positions (Circuit Training baseline, ~1.04–1.79 per benchmark)
     │
-    ├─► Xplace GP (requires Docker + GPU, ~15–180s)
-    │   Routability-aware ePlace with Nesterov optimizer
-    │   Mixed-size mode: handles hard macros + soft macros together
-    │   Output: ISPD2005 Bookshelf .pl → parse → legalize
+    ├─► Multi-fidelity Xplace seed search (requires Docker + GPU)
+    │   Phase A: 100-200 coarse seeds (inner_iter=500, ~8s each)
+    │             Ranked by early-calibrated FastEvaluator (r>0.98)
+    │             Adaptive timeout: 180s first seed (CUDA JIT), EMA after
+    │   Phase B: Full GP (inner_iter=5000) on top-10 coarse winners
+    │             Ranked by oracle cost (captures basin topology)
+    │   Phase C: Warm oracle SA (20-30s each) on top-3
+    │             Picks winner by post-warmup oracle cost
+    │   → Much better basin than single-seed: more diverse candidates
     │
-    ├─► DREAMPlace GP (fallback, CPU/GPU, ~60s)
-    │   Center-init, entropy injection patched at runtime
-    │   Only used if result beats Xplace after legalization
+    ├─► DREAMPlace GP (fallback if Xplace unavailable)
     │
     └─► CT positions (final fallback)
     │
-    Best of above → Sequential SA (3480s budget)
+    Best of above → Sequential SA (remaining budget)
     │
     ├─► CD (Coordinate Descent, delta-HPWL inner loop, oracle outer)
     ├─► LNS (Large Neighborhood Search, cluster swaps)
-    ├─► FD (Finite-Difference gradient descent on proxy)
+    ├─► Adam (WL+density autograd descent, ~10% budget, oracle verify/50 steps)
+    ├─► FD (Finite-Difference full-proxy gradient, congestion-sensitive)
     ├─► hSA (HPWL-surrogate SA, reheated 4×)
-    └─► oSA (Oracle SA tail with FastEvaluator, 383–17000× speedup)
+    └─► oSA (Oracle SA tail with FastEvaluator + oracle sync every 20s)
             │
             └─► FastEvaluator: HPWL + RUDY density + RUDY congestion
                 Calibrated against oracle (Pearson r > 0.98)
+                Oracle sync every 20s: snap-back prevents proxy drift
                 delta_wl() for O(degree) incremental WL
-                congestion_map() for gradient-guided macro selection
     │
     Final micro-legalize (resolves residual sub-4nm overlaps)
 ```

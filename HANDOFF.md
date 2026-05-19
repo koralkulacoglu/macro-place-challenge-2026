@@ -4,10 +4,11 @@
 
 ## Current Status (2026-05-19 Session 4)
 
-- **Branch**: `strategy-may18`
-- **Key discovery**: SA contributes ~0 improvement — fast evaluator drifts in oSA, all candidates oracle-rejected
-- **Completed runs**: ibm01=0.9099, ibm03=1.1758, ibm04=1.1106, ibm06=1.4099, ibm09=0.9506 (all = Xplace GP score)
-- **Active work**: Docker validation of all 3 fixes together (needs GPU)
+- **Branch**: `strategy-may18` (now main)
+- **Key fixes applied**: multi-fidelity Xplace seed search + oSA oracle sync + Adam WL+density + Phase A timeout fix
+- **10-min Docker test results**: ibm06=1.3871 (was 1.4099 ✅), ibm13 started from 1.0604 (was 1.068 ✅), ibm01 Phase A timeout bug fixed
+- **SA now contributes**: oSA oracle sync confirmed working (ibm01: 1.0315 → 1.0258, still improving)
+- **Next**: Full 60-min runs on all 17 benchmarks once ready to submit
 
 ---
 
