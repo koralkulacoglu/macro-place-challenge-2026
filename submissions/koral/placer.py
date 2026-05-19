@@ -226,10 +226,40 @@ class KoralPlacer:
             # filter). Post-SA micro_legalize handles any residual overlaps.
 
         placement = ct_legal  # default: CT positions
-        xpl_tops = None  # top-N Xplace seeds for parallel SA
+        xpl_tops  = None    # top-N Xplace seeds for parallel SA
 
         n_mv_hard = sum(1 for i in range(benchmark.num_hard_macros)
                         if not benchmark.macro_fixed[i])
+
+        # PRE-FORK workers BEFORE Xplace uses the GPU.
+        # Fork copies the parent memory (copy-on-write) while CUDA is still clean.
+        # Workers sleep on their individual task queues until parent sends work.
+        import multiprocessing as _mp
+        _n_prefork = 16 if sys.platform != 'win32' else 0
+        _task_qs   = []
+        _result_q  = None
+        _procs     = []
+
+        if _n_prefork > 0:
+            _ctx = _mp.get_context('fork')
+            _result_q = _ctx.Queue()
+            _task_qs  = [_ctx.Queue() for _ in range(_n_prefork)]
+
+            def _prefork_worker_fn(idx):
+                task = _task_qs[idx].get()   # blocks until parent sends work
+                if task is None:
+                    return                    # poison pill
+                pos_np, sa_budget_w, seed_w = task
+                try:
+                    _result_q.put(_polish_worker(
+                        (benchmark.name, pos_np, sa_budget_w, seed_w)))
+                except Exception as _e:
+                    _result_q.put((pos_np, float('inf')))
+
+            _procs = [_ctx.Process(target=_prefork_worker_fn, args=(i,))
+                      for i in range(_n_prefork)]
+            for _p in _procs: _p.start()
+            budget.log("Workers pre-forked", "n=%d (CUDA clean at fork)" % _n_prefork)
 
                 # Try Xplace multi-seed GP (routability-aware, requires CUDA).
         if self.sa_time_budget >= 300:
@@ -238,9 +268,6 @@ class KoralPlacer:
             best_placement = ct_legal
             budget.log("CT baseline", f"ct_cost={ct_cost:.4f}")
 
-            # â”€â”€ Early FastEvaluator calibration (for Xplace Phase A seed ranking) â”€â”€
-            # Calibrate from CT positions so Phase A can rank 200 seeds in microseconds
-            # rather than spending oracle calls on each seed.
             _fast_early = None
             try:
                 from fast_eval import FastEvaluator as _FE
@@ -254,7 +281,6 @@ class KoralPlacer:
             except Exception as e:
                 print(f"  [fast_eval] early calibration failed: {e}")
 
-            # â”€â”€ Try multi-seed Xplace (routability-driven GP) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             try:
                 xpl_tops = self._run_xplace_multiseed(benchmark, budget, _fast_early, plc)
                 if xpl_tops:
@@ -271,46 +297,23 @@ class KoralPlacer:
                 import traceback
                 print(f"  [start] Xplace multi-seed failed: {e}\n{traceback.format_exc()[-300:]}")
             budget.log("Xplace done", f"best_gp={best_ap_cost:.4f}")
-
             placement = best_placement
 
         if plc is not None and self.sa_time_budget > 0:
-            # SA runs for ALL remaining time minus 2-min safety margin.
-            # Workers use spawn context (avoids CUDA+fork deadlock); up to 16 workers
-            # (one per CPU core on judging machine) from top Xplace seeds found above.
             sa_budget = max(60.0, budget.remaining() - 120.0)
             budget.log("SA start", f"sa_budget={sa_budget:.0f}s")
 
             _start_positions = [p.numpy() for p in xpl_tops] if xpl_tops else [placement.numpy()]
-            # Cap at 16 (one per core on judging machine); 1 on Windows for local testing
-            n_workers = min(len(_start_positions), 16) if sys.platform != 'win32' else 1
+            n_actual = min(len(_start_positions), _n_prefork) if _n_prefork > 0 else 0
 
-            if n_workers > 1:
-                import multiprocessing as _mp
-                # Synchronize CUDA before fork so no locks are held at fork time.
-                # Workers are CPU-only (load fresh benchmark from disk, no CUDA ops),
-                # so fork is safe as long as CUDA is idle.
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                print(f"  [parallel-SA] {n_workers} workers, fork context")
-                ctx = _mp.get_context('fork')
-                result_q = ctx.Queue()
-
-                def _worker_fn(args):
-                    try:
-                        result_q.put(_polish_worker(args))
-                    except Exception as e:
-                        result_q.put((args[1], float('inf')))
-
-                args_list = [
-                    (benchmark.name, pos_np, sa_budget, self.seed + i)
-                    for i, pos_np in enumerate(_start_positions)
-                ]
-                procs = [ctx.Process(target=_worker_fn, args=(a,)) for a in args_list]
-                for p in procs: p.start()
-                for p in procs: p.join()
-                results = [result_q.get() for _ in procs]
+            if n_actual > 0:
+                print(f"  [parallel-SA] {n_actual} workers, pre-forked (CUDA-clean)")
+                for i, pos_np in enumerate(_start_positions[:n_actual]):
+                    _task_qs[i].put((pos_np, sa_budget, self.seed + i))
+                for i in range(n_actual, _n_prefork):
+                    _task_qs[i].put(None)
+                results = [_result_q.get() for _ in range(n_actual)]
+                for _p in _procs: _p.join()
 
                 best_cost, best_np = float('inf'), None
                 for res_np, cost in results:
