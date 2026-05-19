@@ -377,8 +377,8 @@ class KoralPlacer:
     def _xplace_run_one(self, benchmark: Benchmark, tmpdir: str, aux_path: str,
                         xplace_home: str, xplace_main: str, target_density: float,
                         seed: int, inner_iter: int,
-                        noise_ratio: float = 0.025, stop_overflow: float = 0.01,
-                        use_route_force: bool = True) -> "tuple[torch.Tensor | None, float]":
+                        noise_ratio: float = 0.025, stop_overflow: float = 0.05,
+                        use_route_force: bool = False) -> "tuple[torch.Tensor | None, float]":
         """Run one Xplace GP. Returns (positions, elapsed_seconds) or (None, elapsed)."""
         import subprocess, glob as _glob
         result_dir  = os.path.join(tmpdir, f"results_s{seed}")
