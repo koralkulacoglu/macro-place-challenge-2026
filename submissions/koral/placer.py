@@ -1,11 +1,9 @@
 """
-KoralPlacer — DREAMPlace + SA polish for the Partcl Macro Placement Challenge.
+KoralPlacer â€” multi-seed Xplace GP + SA for the Partcl Macro Placement Challenge.
 
 Pipeline:
-  1. Convert Benchmark → Bookshelf files (temp dir)
-  2. Run DREAMPlace (GPU, macro_place_flag=1, legalize_flag=1)
-  3. Recover positions from PlaceDB as center-coord tensor
-  4. SA polish: use compute_proxy_cost as oracle for ~N seconds
+  1. Multi-fidelity Xplace seed search (Phase A coarse â†’ B full GP â†’ C warm SA)
+  2. Best GP start â†’ sequential SA (CD â†’ LNS â†’ Adam â†’ FD â†’ hSA â†’ oSA with oracle sync)
 
 Usage:
   uv run evaluate submissions/koral/placer.py -b ibm01
@@ -18,52 +16,10 @@ import math
 import random
 import time
 import tempfile
-import json
-import logging
 import numpy as np
 import torch
 from pathlib import Path
 
-# ── DREAMPlace paths (inside Docker container) ────────────────────────────────
-_DP_INSTALL = "/opt/dreamplace"
-_DP_PKG     = "/opt/dreamplace/dreamplace"
-for _p in [_DP_INSTALL, _DP_PKG]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-# Stub out CUDA ops that were disabled at build time (CUDA 12.4 CUB API incompatibility).
-# Must run before any DREAMPlace module imports so module-level references resolve correctly.
-# CPU fallbacks are provided where available (pin_pos_cpp for pin_pos_cuda).
-if any(p in sys.path for p in [_DP_INSTALL, _DP_PKG]):
-    import numpy as _np_compat
-    if not hasattr(_np_compat, 'string_'):
-        _np_compat.string_ = _np_compat.bytes_  # NumPy 2.0 compat
-    from types import ModuleType as _ModuleType
-    _dp_cuda_stubs = {
-        'dreamplace.ops.pin_pos.pin_pos_cuda': 'dreamplace.ops.pin_pos.pin_pos_cpp',
-        'dreamplace.ops.pin_pos.pin_pos_cuda_segment': 'dreamplace.ops.pin_pos.pin_pos_cpp',
-        'dreamplace.ops.k_reorder.k_reorder_cuda': None,
-        'dreamplace.ops.global_swap.global_swap_cuda': None,
-        'dreamplace.ops.independent_set_matching.independent_set_matching_cuda': None,
-    }
-    for _cud, _cpu in _dp_cuda_stubs.items():
-        if _cud not in sys.modules:
-            try:
-                __import__(_cud)
-            except (ImportError, Exception):
-                _stub = _ModuleType(_cud.split('.')[-1])
-                if _cpu:
-                    try:
-                        _cpu_mod = __import__(_cpu, fromlist=['forward'])
-                        for _attr in dir(_cpu_mod):
-                            if not _attr.startswith('__'):
-                                setattr(_stub, _attr, getattr(_cpu_mod, _attr))
-                    except (ImportError, Exception):
-                        pass
-                sys.modules[_cud] = _stub
-
-# Suppress DREAMPlace's verbose logging
-logging.getLogger().setLevel(logging.WARNING)
 # Unbuffered output for live progress in nohup/pipe contexts; UTF-8 for Windows cp1252 compat
 sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
 
@@ -73,13 +29,13 @@ from macro_place.objective  import compute_proxy_cost, compute_overlap_metrics
 # Import bookshelf writer from same directory
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
-from bookshelf import write_bookshelf, dreamplace_nodes_to_tensor
+from bookshelf import write_bookshelf
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _load_plc(benchmark: Benchmark):
-    """Reload PlacementCost for a benchmark — needed to call compute_proxy_cost."""
+    """Reload PlacementCost for a benchmark â€” needed to call compute_proxy_cost."""
     try:
         from macro_place.loader import load_benchmark
 
@@ -114,14 +70,6 @@ def _load_plc(benchmark: Benchmark):
     except Exception as e:
         print(f"[warn] Could not load PlacementCost for {benchmark.name}: {e}")
     return None
-
-
-def _dreamplace_available() -> bool:
-    try:
-        import dreamplace.ops.place_io.place_io  # noqa: F401
-        return True
-    except ImportError:
-        return False
 
 
 def _polish_worker(args):
@@ -162,7 +110,7 @@ def _polish_worker(args):
         return placement_np, float('inf')
 
 
-# ── Time budget tracker ──────────────────────────────────────────────────────
+# â”€â”€ Time budget tracker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TimeBudget:
     """Tracks total wall-clock budget across all placement phases.
@@ -201,7 +149,7 @@ class TimeBudget:
         print("".join(parts))
 
 
-# ── Main placer ───────────────────────────────────────────────────────────────
+# â”€â”€ Main placer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class KoralPlacer:
     def __init__(
@@ -209,7 +157,7 @@ class KoralPlacer:
         target_density: float = 0.0,     # 0 = auto from utilization
         density_weight: float = 8e-5,
         gamma: float = 4.0,
-        sa_time_budget: int = int(os.environ.get("KORAL_SA_BUDGET", "3480")),  # 58min SA + ~1min DREAMPlace
+        sa_time_budget: int = int(os.environ.get("KORAL_SA_BUDGET", "3480")),  
         seed: int = 42,
     ):
         self.target_density  = target_density
@@ -233,7 +181,7 @@ class KoralPlacer:
 
         plc = _load_plc(benchmark)
 
-        # Start from CT positions, then try DREAMPlace if available.
+        # Start from CT positions (fallback when Xplace unavailable).
         # CT positions: already near-optimal from Circuit Training (good congestion/density).
         ct = benchmark.macro_positions.clone()
         # Full legalization for significant (>4nm) overlaps; micro-legalize for sub-4nm.
@@ -246,8 +194,8 @@ class KoralPlacer:
         else:
             ct_legal = ct
             # Note: pre-SA micro_legalize causes cascade amplification on dense benchmarks
-            # (ibm06: 47 pairs chain-react, each 7nm push creates new overlaps → 15μm max
-            # displacement → oracle 1.87 vs CT's 1.66). SA preserves existing sub-4nm
+            # (ibm06: 47 pairs chain-react, each 7nm push creates new overlaps â†’ 15Î¼m max
+            # displacement â†’ oracle 1.87 vs CT's 1.66). SA preserves existing sub-4nm
             # overlaps but also won't place macros INTO overlapping positions (via _overlaps
             # filter). Post-SA micro_legalize handles any residual overlaps.
 
@@ -256,16 +204,14 @@ class KoralPlacer:
         n_mv_hard = sum(1 for i in range(benchmark.num_hard_macros)
                         if not benchmark.macro_fixed[i])
 
-        # Try analytical placers: Xplace (preferred) → DREAMPlace → CT fallback.
-        # Xplace: routability-aware GP, directly targets congestion. Requires CUDA.
-        # DREAMPlace: WL+density GP, entropy injection patched at runtime. CPU/GPU.
+                # Try Xplace multi-seed GP (routability-aware, requires CUDA).
         if self.sa_time_budget >= 300:
             ct_cost = compute_proxy_cost(ct_legal, benchmark, plc)["proxy_cost"] if plc else float('inf')
             best_ap_cost = ct_cost
             best_placement = ct_legal
             budget.log("CT baseline", f"ct_cost={ct_cost:.4f}")
 
-            # ── Early FastEvaluator calibration (for Xplace Phase A seed ranking) ──
+            # â”€â”€ Early FastEvaluator calibration (for Xplace Phase A seed ranking) â”€â”€
             # Calibrate from CT positions so Phase A can rank 200 seeds in microseconds
             # rather than spending oracle calls on each seed.
             _fast_early = None
@@ -281,14 +227,14 @@ class KoralPlacer:
             except Exception as e:
                 print(f"  [fast_eval] early calibration failed: {e}")
 
-            # ── Try multi-seed Xplace (routability-driven GP) ────────────────
+            # â”€â”€ Try multi-seed Xplace (routability-driven GP) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             try:
                 xpl = self._run_xplace_multiseed(benchmark, budget, _fast_early, plc)
                 if xpl is not None:
                     if self._count_hard_overlaps_f32(xpl, benchmark) == 0 and plc is not None:
                         xpl_cost = compute_proxy_cost(xpl, benchmark, plc)["proxy_cost"]
                         if xpl_cost < best_ap_cost:
-                            print(f"  [start] Xplace multi-seed {xpl_cost:.4f} < CT {best_ap_cost:.4f} ✓")
+                            print(f"  [start] Xplace multi-seed {xpl_cost:.4f} < CT {best_ap_cost:.4f} âœ“")
                             best_ap_cost = xpl_cost
                             best_placement = xpl
                         else:
@@ -299,24 +245,6 @@ class KoralPlacer:
                 import traceback
                 print(f"  [start] Xplace multi-seed failed: {e}\n{traceback.format_exc()[-300:]}")
             budget.log("Xplace done", f"best_gp={best_ap_cost:.4f}")
-
-            # ── Try DREAMPlace (WL+density GP) as fallback/complement ────────
-            if _dreamplace_available():
-                try:
-                    dp = self._run_dreamplace(benchmark, center_init=True,
-                                              fix_soft=False, dp_seed=self.seed)
-                    dp = self._legalize_hard(dp, benchmark)
-                    if self._count_hard_overlaps_f32(dp, benchmark) == 0 and plc is not None:
-                        dp_cost = compute_proxy_cost(dp, benchmark, plc)["proxy_cost"]
-                        if dp_cost < best_ap_cost:
-                            print(f"  [start] DREAMPlace(center-init) {dp_cost:.4f} < best {best_ap_cost:.4f} ✓")
-                            best_ap_cost = dp_cost
-                            best_placement = dp
-                        else:
-                            print(f"  [start] DREAMPlace(center-init) {dp_cost:.4f} >= best {best_ap_cost:.4f}")
-                except Exception as e:
-                    print(f"  [start] DREAMPlace(center-init) failed: {e}")
-                budget.log("DREAMPlace done", f"best_gp={best_ap_cost:.4f}")
 
             placement = best_placement
 
@@ -332,7 +260,7 @@ class KoralPlacer:
             # Uses fork (Linux/Docker only) so workers inherit parent memory without pickling.
             # Falls back to sequential on Windows (spawn has import-path complexity).
             #
-            # CUDA + fork deadlock: forking after Xplace/DREAMPlace used CUDA leaves workers
+            # CUDA + fork deadlock: forking after Xplace used CUDA leaves workers
             # blocked on futex_wait_queue (background CUDA threads hold locks that the forked
             # child processes inherit but can never acquire). Fix: use n_workers=1 (sequential,
             # no fork) when CUDA was active. Sequential SA with full time budget from a good
@@ -342,7 +270,7 @@ class KoralPlacer:
                          if sys.platform != 'win32' else 1)
             if _cuda_was_active and n_workers > 1:
                 n_workers = 1
-                print("  [parallel-SA] CUDA was active → sequential SA (fork+CUDA deadlocks)")
+                print("  [parallel-SA] CUDA was active â†’ sequential SA (fork+CUDA deadlocks)")
             if n_workers > 1:
                 import multiprocessing as _mp
                 print(f"  [parallel-SA] {n_workers} workers, seeds {self.seed}..{self.seed+n_workers-1}")
@@ -396,232 +324,6 @@ class KoralPlacer:
                 placement = self._cd_lns_polish(placement, benchmark, plc, budget=budget)
 
         budget.log("done", f"benchmark={benchmark.name}")
-        return placement
-
-    # ── DREAMPlace stage ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def _patch_macro_legalize(n_hard_movable: int):
-        """
-        Monkey-patch DREAMPlace's macro legalization to only process hard macros.
-        The Hannan-grid search for soft macros is extremely slow on large benchmarks.
-        Since our Bookshelf ordering puts hard macros first (indices 0..n_hard_movable-1),
-        temporarily reducing num_movable_nodes to n_hard_movable limits legalization to
-        hard macros only, letting soft macros stay at their global-placement positions.
-        """
-        try:
-            import dreamplace.ops.macro_legalize.macro_legalize as _ml
-            if getattr(_ml.MacroLegalize, '_koral_patched', False):
-                _ml.MacroLegalize._koral_n_hard = n_hard_movable
-                return
-            _orig_call = _ml.MacroLegalize.__call__
-
-            def _fast_call(self, init_pos, pos):
-                n_hard = getattr(_ml.MacroLegalize, '_koral_n_hard', None)
-                if n_hard is not None and n_hard < self.num_movable_nodes:
-                    orig_n = self.num_movable_nodes
-                    self.num_movable_nodes = n_hard
-                    try:
-                        return _orig_call(self, init_pos, pos)
-                    finally:
-                        self.num_movable_nodes = orig_n
-                return _orig_call(self, init_pos, pos)
-
-            _ml.MacroLegalize.__call__ = _fast_call
-            _ml.MacroLegalize._koral_patched = True
-            _ml.MacroLegalize._koral_n_hard = n_hard_movable
-            print(f"  [patch] macro_legalize limited to {n_hard_movable} hard macros")
-        except Exception as e:
-            print(f"  [patch] macro_legalize patch failed: {e} — legalization may be slow")
-
-    def _run_dreamplace(self, benchmark: Benchmark, center_init: bool = True,
-                        fix_soft: bool = False, dp_seed: int = None) -> torch.Tensor:
-        import Params
-        import PlaceDB
-        import NonLinearPlace
-
-        # One-time patch: disable the Lgamma early-stop divergence heuristic in new DREAMPlace.
-        # New DREAMPlace stops when hpwl > 2× best_hpwl — during center-init spreading, macros
-        # move apart causing WL to temporarily spike, triggering this stop after only ~50 steps.
-        # Old DREAMPlace didn't have this check and ran to full convergence (0.9697 for ibm01).
-        # Patch the source file and reload the module so all subsequent calls use the fixed version.
-        try:
-            import os, sys, pathlib
-            _nlp_src = pathlib.Path('/opt/dreamplace/dreamplace/NonLinearPlace.py')
-            if _nlp_src.exists() and '# koral: all_disabled' not in _nlp_src.read_text():
-                _src = _nlp_src.read_text()
-                # 1. Remove hpwl>2×best divergence early-stop (WL spikes during center-init
-                #    spreading cause false positives that abort optimization after ~50 steps)
-                _src = _src.replace(
-                    'and cur_metric.hpwl > best_metric[0].hpwl * 2',
-                    'and False  # koral: lgamma_div_disabled'
-                )
-                # 2. Disable entropy injection (overflow>0.95 branch that adds large Gaussian
-                #    noise and scrambles macros; makes center-init stochastic and unreliable)
-                _src = _src.replace(
-                    'if overflow_list[-1] > 0.95:  # stuck at very high overflow',
-                    'if False:  # koral: entropy_injection_disabled'
-                )
-                # Mark file as patched
-                _src = _src.replace(
-                    '# koral: lgamma_div_disabled',
-                    '# koral: lgamma_div_disabled  # koral: all_disabled',
-                    1  # only first occurrence
-                )
-                _nlp_src.write_text(_src)
-                # Clear bytecache so Python reloads from source
-                _pycache = pathlib.Path('/opt/dreamplace/dreamplace/__pycache__')
-                for _f in _pycache.glob('NonLinearPlace*.pyc'):
-                    _f.unlink(missing_ok=True)
-                # Force module reload
-                for _k in [k for k in sys.modules if 'NonLinearPlace' in k]:
-                    del sys.modules[_k]
-                import NonLinearPlace  # noqa: F811
-                print("  [patch] NonLinearPlace: Lgamma div-stop + entropy injection disabled")
-        except Exception as _e:
-            print(f"  [patch] NonLinearPlace patch failed: {_e}")
-
-        # Compute target density from benchmark area utilization
-        target_density = self.target_density
-        if target_density == 0.0:
-            macro_area = (benchmark.macro_sizes[:, 0] * benchmark.macro_sizes[:, 1]).sum().item()
-            canvas_area = benchmark.canvas_width * benchmark.canvas_height
-            utilization = macro_area / canvas_area
-            # Headroom: center-init starts from scatter → needs 20% headroom to allow spreading.
-            # CT-init starts near-optimal → 5% headroom prevents over-constraining the layout.
-            target_density = min(0.95, utilization + (0.20 if center_init else 0.05))
-
-        with tempfile.TemporaryDirectory(prefix=f"koral_{benchmark.name}_") as tmpdir:
-            movable_hard = [i for i in range(benchmark.num_hard_macros)
-                            if not benchmark.macro_fixed[i]]
-            fixed_hard   = [i for i in range(benchmark.num_hard_macros)
-                            if benchmark.macro_fixed[i]]
-            movable_soft = list(range(benchmark.num_hard_macros, benchmark.num_macros))
-            # DREAMPlace ordering: movable_hard first, then movable_soft, then fixed_hard.
-            # The monkey-patch below limits macro legalization to the first
-            # len(movable_hard) nodes (hard macros only), skipping the slow Hannan-grid
-            # search for thousands of soft macros.
-            ordered = movable_hard + movable_soft + fixed_hard
-
-            aux_path = write_bookshelf(benchmark, tmpdir, fix_soft=fix_soft)
-
-            # Adaptive DREAMPlace iterations based on GPU availability.
-            # GPU: use CUDA when available. pin_pos_cuda compiles fine with CUDA 12.4;
-            # only pin_pos_cuda_segment + 3 detailed-place ops are disabled (CUB API compat).
-            # detailed_place_flag=0 so those disabled ops are never invoked.
-            n_mv_hard = len(movable_hard)
-            # Use GPU only if CUDA is available AND the real pin_pos_cuda .so loaded.
-            # If pin_pos_cuda failed to import, our stub substitutes pin_pos_cpp (CPU).
-            # Calling a CPU op with GPU tensors (gpu=1 mode) causes a runtime crash.
-            _gpu = 0
-            if torch.cuda.is_available():
-                try:
-                    import dreamplace.ops.pin_pos.pin_pos_cuda as _ppc
-                    if getattr(_ppc, '__file__', None) is not None:
-                        _gpu = 1
-                except Exception:
-                    pass
-            if _gpu:
-                # GPU: 700+1000 matching session-1 CPU iteration counts that gave ibm01=0.9697.
-                # With Lgamma divergence stop patched out, more iterations now converge properly.
-                _iters1, _iters2 = 700, 1000
-            else:
-                # CPU: same counts as the working session-1 test.
-                _iters1, _iters2 = 700, 1000
-
-            # Build DREAMPlace params
-            params_dict = {
-                "aux_input":          aux_path,
-                "gpu":                _gpu,
-                "target_density":     target_density,
-                "density_weight":     self.density_weight,
-                "gamma":              self.gamma,
-                "macro_place_flag":   0,
-                "legalize_flag":        0,
-                "abacus_legalize_flag": 0,
-                "detailed_place_flag":  0,
-                "global_place_flag":  1,
-                "enable_fillers":     1,
-                "stop_overflow":      0.01 if center_init else 0.03,
-                # center-init: 0.01 is the original working value from session 1 (ibm01=0.9697).
-                # The rollback at [1.1%, 4%] overflow that was problematic is now prevented by
-                # disabling the Lgamma divergence stop (patched in NonLinearPlace.py above).
-                # CT-init: 3% — CT positions start at ~4% overflow.
-                "gp_noise_ratio":     0.025 if center_init else 0.01,
-                "random_center_init_flag": 1 if center_init else 0,
-                "ignore_net_degree":  100,
-                "num_threads":        8,
-                "random_seed":        dp_seed if dp_seed is not None else self.seed,
-                "scale_factor":       0.0,
-                "result_dir":         os.path.join(tmpdir, "results"),
-                "global_place_stages": [
-                    {
-                        "num_bins_x": 64, "num_bins_y": 64,   # coarse first (matches working session-1 params)
-                        "iteration": _iters1, "learning_rate": 0.01,
-                        "wirelength": "weighted_average",
-                        "optimizer": "nesterov",
-                        "Llambda_density_weight_iteration": 1,
-                        "Lsub_iteration": 1,
-                    },
-                    {
-                        "num_bins_x": 256, "num_bins_y": 256,  # fine second
-                        "iteration": _iters2, "learning_rate": 0.01,
-                        "wirelength": "weighted_average",
-                        "optimizer": "nesterov",
-                        "Llambda_density_weight_iteration": 1,
-                        "Lsub_iteration": 1,
-                    },
-                ],
-                "macro_halo_x": 50,
-                "macro_halo_y": 50,
-                "plot_flag":    0,
-                "dtype":        "float32",
-            }
-
-            params_path = os.path.join(tmpdir, "params.json")
-            with open(params_path, "w") as f:
-                json.dump(params_dict, f)
-
-            params = Params.Params(); params.load(params_path)
-            placedb = PlaceDB.PlaceDB(); placedb(params)
-
-            # Compatibility fix: newer DREAMPlace sets quad_penalty=True during a convergence
-            # stall. If init_density was set by a fence-region path before obj_fn's lazy init
-            # block runs, quad_penalty_coeff is never initialized. Patch PlaceObj.obj_fn so
-            # the guard runs before the attribute access.
-            # NonLinearPlace imports PlaceObj as a bare name; patch that module to affect the
-            # same class object (not dreamplace.PlaceObj which is a different sys.modules key).
-            try:
-                import PlaceObj as _po_mod
-            except ImportError:
-                try:
-                    import dreamplace.PlaceObj as _po_mod
-                except ImportError:
-                    _po_mod = None
-            if _po_mod is not None:
-                _PlaceObj_cls = _po_mod.PlaceObj
-                if not getattr(_PlaceObj_cls, '_koral_qpc_patched', False):
-                    _orig_obj_fn = _PlaceObj_cls.obj_fn
-                    def _patched_obj_fn(self, pos, _orig=_orig_obj_fn):
-                        if not hasattr(self, 'quad_penalty_coeff') and getattr(self, 'quad_penalty', False):
-                            self.quad_penalty_coeff = 0.0  # disables quadratic penalty safely
-                        return _orig(self, pos)
-                    _PlaceObj_cls.obj_fn = _patched_obj_fn
-                    _PlaceObj_cls._koral_qpc_patched = True
-
-            placer = NonLinearPlace.NonLinearPlace(params, placedb, timer=None)
-            placer(params, placedb, learning_rate_value=None)
-
-            # Recover positions
-            num_ports = benchmark.port_positions.shape[0]
-            placement = dreamplace_nodes_to_tensor(
-                placedb, ordered, fixed_hard, num_ports, benchmark
-            )
-
-        # Inner legalization: resolve DREAMPlace micro-overlaps so the outer legalization
-        # starts from a better state (important for dense benchmarks where DREAMPlace
-        # leaves many small overlaps that a single 2000-pass outer legalization may not resolve).
-        placement = self._legalize_hard(placement, benchmark)
         return placement
 
     @staticmethod
@@ -943,26 +645,8 @@ class KoralPlacer:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def _run_xplace(self, benchmark: Benchmark) -> torch.Tensor:
-        """Single-seed Xplace GP (backward-compat wrapper). Prefer _run_xplace_multiseed."""
-        xplace_home, xplace_main = self._xplace_available()
-        if xplace_home is None:
-            print("  [Xplace] not available")
-            return None
-        macro_area     = (benchmark.macro_sizes[:, 0] * benchmark.macro_sizes[:, 1]).sum().item()
-        target_density = min(0.95, macro_area / (benchmark.canvas_width * benchmark.canvas_height) + 0.15)
-        with tempfile.TemporaryDirectory(prefix=f"koral_{benchmark.name}_xpl_") as tmpdir:
-            aux_path = write_bookshelf(benchmark, tmpdir, fix_soft=False)
-            print(f"  [Xplace] running GP on {benchmark.name} (seed={self.seed})...")
-            pos, elapsed = self._xplace_run_one(
-                benchmark, tmpdir, aux_path, xplace_home, xplace_main,
-                target_density, seed=self.seed, inner_iter=5000, timeout=600
-            )
-            if pos is not None:
-                print(f"  [Xplace] completed in {elapsed:.0f}s")
-            return pos
+    # ── Legalization helpers ──────────────────────────────────────────────────
 
-    # ── Post-DREAMPlace legalization ──────────────────────────────────────────
 
     @staticmethod
     def _count_hard_overlaps_f32(placement: torch.Tensor, benchmark: Benchmark) -> int:
@@ -1002,10 +686,10 @@ class KoralPlacer:
 
     def _legalize_hard(self, placement: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
         """
-        Fast O(N² × passes) push-based legalization of hard macros.
+        Fast O(NÂ² Ã— passes) push-based legalization of hard macros.
         Each pass scans all pairs; overlapping pairs are resolved by pushing
         the movable macro in the minimum-displacement direction (x or y).
-        Converges in a few passes for typical DREAMPlace outputs.
+        Converges in a few passes for typical Xplace/CT outputs.
         """
         GAP = 0.005  # 5nm gap to ensure float32 conversion doesn't re-introduce overlaps
 
@@ -1040,7 +724,7 @@ class KoralPlacer:
             if not is_ov.any():
                 break
 
-            # Sequential (Gauss-Seidel) push — handles boundary clamping correctly:
+            # Sequential (Gauss-Seidel) push â€” handles boundary clamping correctly:
             # when one macro is clamped, the full push goes to its unclamped neighbor.
             changed = False
             for i in range(n):
@@ -1149,7 +833,7 @@ class KoralPlacer:
         Uses 3nm gap (vs 5nm in _legalize_hard) to minimize cost impact.
         Called before SA (to fix CT overlaps) and after SA (to fix any residual).
         """
-        GAP = 0.003  # 3nm — survives float32 conversion
+        GAP = 0.003  # 3nm â€” survives float32 conversion
         n = benchmark.num_hard_macros
         sizes = benchmark.macro_sizes[:n].numpy().astype(np.float64)
         movable = benchmark.get_movable_mask()[:n].numpy().astype(bool)
@@ -1278,17 +962,17 @@ class KoralPlacer:
         result[:n] = torch.tensor(pos, dtype=torch.float32)
         return result
 
-    # ── HPWL data structures ─────────────────────────────────────────────────
+    # â”€â”€ HPWL data structures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_hpwl_data(self, benchmark: Benchmark, pos: np.ndarray):
         """
         Precompute connectivity data for fast incremental HPWL in SA.
 
         Returns:
-            macro_nets: list[list[int]] — for each movable hard macro, net IDs it belongs to
-            net_hard:   list[list[int]] — for each net, movable hard macro indices in it
-            net_fbbox:  np.ndarray [num_nets, 4] — fixed-node bbox (min_x,max_x,min_y,max_y)
-            net_wts:    np.ndarray [num_nets] — net weights
+            macro_nets: list[list[int]] â€” for each movable hard macro, net IDs it belongs to
+            net_hard:   list[list[int]] â€” for each net, movable hard macro indices in it
+            net_fbbox:  np.ndarray [num_nets, 4] â€” fixed-node bbox (min_x,max_x,min_y,max_y)
+            net_wts:    np.ndarray [num_nets] â€” net weights
         """
         n_hard  = benchmark.num_hard_macros
         n_mac   = benchmark.num_macros
@@ -1314,7 +998,7 @@ class KoralPlacer:
                     hard_in.append(n)
                     macro_nets[n].append(k)
                 else:
-                    # Fixed node — contribute to fixed bbox
+                    # Fixed node â€” contribute to fixed bbox
                     px = float(all_pos[n, 0])
                     py = float(all_pos[n, 1])
                     if px < net_fbbox[k, 0]: net_fbbox[k, 0] = px
@@ -1390,7 +1074,7 @@ class KoralPlacer:
 
         return pos
 
-    # ── CD + LNS polish stage ─────────────────────────────────────────────────
+    # â”€â”€ CD + LNS polish stage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _cd_lns_polish(
         self,
@@ -1435,7 +1119,7 @@ class KoralPlacer:
         # Current orientation per hard macro: 0=N, 1=FN(flipX pins), 2=FS(flipY), 3=S(flipXY)
         ori    = np.zeros(n_hard, dtype=np.int8)
 
-        # ── Precompute pin-level net data ─────────────────────────────────────
+        # â”€â”€ Precompute pin-level net data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # all_cx/cy: positions of ALL nodes (hard macros, soft macros, ports)
         all_cx = np.zeros(n_mac + n_ports)
         all_cy = np.zeros(n_mac + n_ports)
@@ -1646,7 +1330,7 @@ class KoralPlacer:
                     if fb is not None:
                         macro_fix_bbox[i][k] = fb
 
-        # ── Initial oracle evaluation ─────────────────────────────────────────
+        # â”€â”€ Initial oracle evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         init_result = compute_proxy_cost(
             torch.tensor(pos, dtype=torch.float32), benchmark, plc
         )
@@ -1657,7 +1341,7 @@ class KoralPlacer:
         best_ori  = ori.copy()
         print(f"  [CD] initial={init_cost:.4f} (wl_frac={_wl_frac:.2%})")
 
-        # ── Fast evaluator (300-4000x speedup for SA inner loops) ────────────
+        # â”€â”€ Fast evaluator (300-4000x speedup for SA inner loops) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Calibrate once here; oracle stays synced from initial eval above.
         try:
             from fast_eval import FastEvaluator as _FE
@@ -1704,7 +1388,7 @@ class KoralPlacer:
 
         _budget_log("CD start", f"initial={best_cost:.4f}  wl_frac={_wl_frac:.1%}")
 
-        # ── Coordinate Descent ────────────────────────────────────────────────
+        # â”€â”€ Coordinate Descent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         while time.time() < deadline:
             frac = max(0.0, (deadline - time.time()) / self.sa_time_budget)
             # Annealed move scale: start large, end small
@@ -1747,7 +1431,7 @@ class KoralPlacer:
             if n_accepted == 0:
                 break
 
-            # ── Oracle call once per pass ─────────────────────────────────────
+            # â”€â”€ Oracle call once per pass â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             cost = compute_proxy_cost(
                 torch.tensor(pos, dtype=torch.float32), benchmark, plc
             )["proxy_cost"]
@@ -1767,7 +1451,7 @@ class KoralPlacer:
 
         _budget_log("LNS start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
-        # ── LNS: pairwise swaps in spatial clusters ───────────────────────────
+        # â”€â”€ LNS: pairwise swaps in spatial clusters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # _overlaps_excl: check if macro i at (cx,cy) overlaps anything except macro excl
         def _overlaps_excl(i, cx, cy, excl):
             dx = np.abs(cx - pos[:n_hard, 0]); dy = np.abs(cy - pos[:n_hard, 1])
@@ -1833,7 +1517,7 @@ class KoralPlacer:
         lns_improvements = 0
         lns_no_swap_streak = 0
         # Cap LNS time adaptively based on WL fraction of initial proxy cost.
-        # Low-WL benchmarks (ibm06, wl_frac=3%): 15% cap (90s) → oracle SA gets 460s+
+        # Low-WL benchmarks (ibm06, wl_frac=3%): 15% cap (90s) â†’ oracle SA gets 460s+
         # to exploit improvements that oracle SA CAN find for such benchmarks.
         # High-WL benchmarks (ibm03+, wl_frac=20%+): up to 50% (300s) since LNS is
         # the primary optimizer for them. WL-dominated benchmarks that exit LNS
@@ -1883,8 +1567,8 @@ class KoralPlacer:
                 if lns_no_swap_streak >= n_mv * 2:
                     break  # explored enough clusters; HPWL-improving swaps exhausted
 
-        # ── Adam WL+density spread: fast autograd pre-step before FD ────────────────
-        # fast.evaluate() only has differentiable WL + density (congestion uses numpy →
+        # â”€â”€ Adam WL+density spread: fast autograd pre-step before FD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # fast.evaluate() only has differentiable WL + density (congestion uses numpy â†’
         # zero grad). Adam on WL+density runs 500-1000 steps in 60s vs FD's 6-10 oracle
         # steps; FD still follows to capture the full congestion-sensitive gradient.
         # Oracle verifies every 50 Adam steps; reverts if no improvement.
@@ -1933,11 +1617,11 @@ class KoralPlacer:
 
         _budget_log("FD start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
-        # ── FD gradient descent (targets congestion/density, blind to HPWL gradient) ──
-        # For each of the top-k congested macros: compute ∂proxy/∂x and ∂proxy/∂y via
-        # 1-sided FD (probe at pos+δ, compare to best_cost). Apply normalized gradient
+        # â”€â”€ FD gradient descent (targets congestion/density, blind to HPWL gradient) â”€â”€
+        # For each of the top-k congested macros: compute âˆ‚proxy/âˆ‚x and âˆ‚proxy/âˆ‚y via
+        # 1-sided FD (probe at pos+Î´, compare to best_cost). Apply normalized gradient
         # step, legalize, verify. Repeats until no improvement or step size collapses.
-        # Cost: 2*fd_k oracle calls per gradient step + 1 verify ≈ 41 calls/step at k=20.
+        # Cost: 2*fd_k oracle calls per gradient step + 1 verify â‰ˆ 41 calls/step at k=20.
         oracle_time_est = max(0.5, (time.time() - (deadline - self.sa_time_budget)) / max(1, oracle_calls))
         fd_k = min(n_mv, 20)
         # Run FD for ALL benchmarks. For congestion-dominated (wl_frac < 4%), use larger
@@ -2032,15 +1716,15 @@ class KoralPlacer:
 
         _budget_log("hSA start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
-        # ── HPWL-guided SA with periodic oracle checkpoints ──────────────────────
+        # â”€â”€ HPWL-guided SA with periodic oracle checkpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Uses HPWL as fast surrogate (O(degree), ~0.01ms/call) for SA acceptance,
         # with proxy oracle checkpoint every HPWL_CKPT_N accepted moves (~0.5s/call).
-        # Explores ~50× more positions per oracle call budget vs pure oracle SA.
+        # Explores ~50Ã— more positions per oracle call budget vs pure oracle SA.
         # Move mix: 65% Gaussian translation, 15% rotation, 20% swap (dense only).
         # Adaptive HPWL_CKPT_N: frequent oracle for congestion-dominated benchmarks.
         remaining = deadline - time.time()
         oracle_time_est = max(0.5, (time.time() - (deadline - self.sa_time_budget)) / max(1, oracle_calls))
-        # More frequent oracle for congestion-dominated benchmarks (HPWL ≠ proxy there).
+        # More frequent oracle for congestion-dominated benchmarks (HPWL â‰  proxy there).
         HPWL_CKPT_N = max(5, min(50, int(50 * _wl_frac * 1.5)))
 
         if remaining > oracle_time_est * 8:
@@ -2079,7 +1763,7 @@ class KoralPlacer:
                 T_hsa = T_hsa_current_start * math.exp(
                     math.log(max(hpwl_T_end, T_hsa_current_start * 1e-6) / T_hsa_current_start) * frac
                 )
-                # Multi-phase sigma: broad exploration → focused exploitation → fine-tuning.
+                # Multi-phase sigma: broad exploration â†’ focused exploitation â†’ fine-tuning.
                 # Resets after each reheat since frac restarts from 0.
                 if frac < 0.15:
                     scale_hsa = max(cw, ch) * 0.12
@@ -2177,7 +1861,7 @@ class KoralPlacer:
                                 _pcx = float(np.clip(_perturb[_pmi, 0] + random.gauss(0, _pscale), hw[_pmi], cw - hw[_pmi]))
                                 _pcy = float(np.clip(_perturb[_pmi, 1] + random.gauss(0, _pscale), hh[_pmi], ch - hh[_pmi]))
                                 _perturb[_pmi, 0] = _pcx; _perturb[_pmi, 1] = _pcy
-                            # Use micro_legalize (1nm gap) for perturbation — full legalize
+                            # Use micro_legalize (1nm gap) for perturbation â€” full legalize
                             # is too slow for dense benchmarks (ibm06 takes minutes).
                             _perturb_t = self._micro_legalize(torch.tensor(_perturb, dtype=torch.float32), benchmark)
                             _perturb = _perturb_t.numpy()
@@ -2232,7 +1916,7 @@ class KoralPlacer:
 
         _budget_log("oSA start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
-        # ── Oracle SA tail: direct proxy minimization with remaining time ─────
+        # â”€â”€ Oracle SA tail: direct proxy minimization with remaining time â”€â”€â”€â”€â”€
         # hSA uses HPWL surrogate which doesn't correlate for congestion-dominated
         # benchmarks. After hSA stagnates, use oracle (compute_proxy_cost) directly
         # for single-macro moves. Only helps when micro_legalize will succeed (no
@@ -2244,12 +1928,12 @@ class KoralPlacer:
         if _osa_remain > oracle_time_est * 5 and _osa_micro_ok:
             _pre_osa_best_pos = best_pos.copy(); _pre_osa_best_cost = best_cost  # save for revert
             _rebuild_state(best_pos, best_ori)
-            # Adaptive scale: large early (broad exploration) → shrink over time (exploitation).
+            # Adaptive scale: large early (broad exploration) â†’ shrink over time (exploitation).
             # Congestion-dominated benchmarks use a larger base scale (macros need bigger moves to
             # escape congested bins; 4% probe would miss bin boundaries).
             _osa_scale_base = max(cw, ch) * (0.08 if _wl_frac < 0.04 else 0.04)
 
-            # ── oSA uses fast evaluator when available (300-17000x speedup) ──
+            # â”€â”€ oSA uses fast evaluator when available (300-17000x speedup) â”€â”€
             # fast.evaluate: 383-763x faster than oracle (full WL+density+cong approx)
             # fast.delta_wl: 4000-17000x faster (WL-only incremental, for translations)
             # Fall back to oracle if fast evaluator is unavailable or miscalibrated.
@@ -2260,14 +1944,14 @@ class KoralPlacer:
                 _fast_best = _fast_cur
                 _fast_best_pos = pos.copy()
                 # Temperature in fast-eval scale.
-                # 0.001 × cost: accepts 91% of moves worsening by 0.1% (one typical step),
-                # 39% of moves worsening by 0.1 × cost (far worse). This is more selective
+                # 0.001 Ã— cost: accepts 91% of moves worsening by 0.1% (one typical step),
+                # 39% of moves worsening by 0.1 Ã— cost (far worse). This is more selective
                 # than 0.010 (which would accept 99% of typical worsening moves = random walk).
                 _osa_T = _fast_cur * 0.001
                 # For congestion-dominated benchmarks (wl_frac < 0.15): delta_wl captures only
                 # ~6-15% of the cost signal; using it for translation leads to random-walk behavior.
                 # Use full fast.evaluate for ALL moves on these benchmarks (383x speedup is still huge).
-                # For WL-dominated (wl_frac >= 0.15): delta_wl captures majority of signal → safe.
+                # For WL-dominated (wl_frac >= 0.15): delta_wl captures majority of signal â†’ safe.
                 _osa_use_delta_wl = (_wl_frac >= 0.15)
                 _osa_sync_interval = 500 if _osa_use_delta_wl else 1  # sync=1 means always full evaluate
                 _osa_delta_steps   = 0
@@ -2312,7 +1996,7 @@ class KoralPlacer:
             # Root cause of prior failure: oSA ran 1-4M fast moves, found 300-800 "fast-best"
             # updates, but every oracle check at the end failed (proxy drift outside calibration
             # range). Fix: oracle every 20s + immediate check on >0.5% fast improvement.
-            # On oracle miss → snap pos back to oracle-confirmed best so drift can't accumulate.
+            # On oracle miss â†’ snap pos back to oracle-confirmed best so drift can't accumulate.
             _osa_last_oracle_t = time.time()
             _osa_oracle_interval_s = 20.0  # oracle sync every 20s (~60s total overhead per 3600s)
             _osa_oracle_best_fast = _fast_best if _use_fast_osa else float('inf')
@@ -2322,11 +2006,11 @@ class KoralPlacer:
                 # Adaptive scale: decay from base to 25% of base as time runs out
                 _t_frac = min(1.0, (time.time() - _osa_t0) / max(1e-9, _osa_deadline - _osa_t0))
                 _osa_scale = _osa_scale_base * max(0.25, 1.0 - 0.75 * _t_frac)
-                # Temperature annealing: hot → cold over oSA budget.
-                # At t=0: T = _osa_T (initial). At t=1: T = 0.01 × _osa_T (near-greedy).
+                # Temperature annealing: hot â†’ cold over oSA budget.
+                # At t=0: T = _osa_T (initial). At t=1: T = 0.01 Ã— _osa_T (near-greedy).
                 _osa_T_cur = _osa_T * max(0.01, 1.0 - 0.99 * _t_frac)
 
-                # ── Oracle sync: verify fast-best with oracle periodically ──────
+                # â”€â”€ Oracle sync: verify fast-best with oracle periodically â”€â”€â”€â”€â”€â”€
                 # Trigger on: (a) time interval OR (b) fast improved >0.5% vs oracle baseline.
                 # On oracle miss: snap back so fast evaluator re-anchors to a valid region.
                 if _use_fast_osa and _osa_tries > 0:
@@ -2345,7 +2029,7 @@ class KoralPlacer:
                             print(f"  [oSA oracle] t={time.time()-_osa_t0:.0f}s  "
                                   f"oracle_best={_oc:.4f}  fast={_fast_best:.4f}")
                         else:
-                            # Fast evaluator drifted — snap back to oracle-confirmed best
+                            # Fast evaluator drifted â€” snap back to oracle-confirmed best
                             pos[:] = best_pos
                             all_cx[:n_mac] = pos[:n_mac, 0]; all_cy[:n_mac] = pos[:n_mac, 1]
                             _fast_cur = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
@@ -2492,7 +2176,7 @@ class KoralPlacer:
                     pos[ci, 0] = old_x; pos[ci, 1] = old_y
                     all_cx[ci] = old_x; all_cy[ci] = old_y
 
-            # ── After fast oSA: best_pos is already oracle-verified (ongoing syncs) ─
+            # â”€â”€ After fast oSA: best_pos is already oracle-verified (ongoing syncs) â”€
             if _use_fast_osa:
                 # Restore pos to oracle-confirmed best (fast moves may have left pos elsewhere)
                 pos[:] = best_pos; ori[:] = best_ori
@@ -2587,7 +2271,7 @@ class KoralPlacer:
             if _ils_count > 0:
                 print(f"  [ILS] {_ils_count} restarts ({_ils_ok_count} micro OK), best={best_cost:.4f}")
 
-        # ── Final soft-macro update (revert if no gain) ───────────────────────
+        # â”€â”€ Final soft-macro update (revert if no gain) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _rebuild_state(best_pos, best_ori)
         pos_with_soft_update = self._update_soft_macros(pos.copy(), benchmark)
         soft_cost = compute_proxy_cost(
@@ -2603,7 +2287,7 @@ class KoralPlacer:
 
         _budget_log("SA done", f"final={best_cost:.4f}  oracle_calls={oracle_calls}  passes={pass_num}")
         result = torch.tensor(best_pos, dtype=torch.float32)
-        # Full legalization if significant (>4nm) overlaps remain (e.g. after DREAMPlace).
+        # Full legalization if significant (>4nm) overlaps remain (e.g. after Xplace legalization).
         if self._count_significant_overlaps(result, benchmark, threshold=0.004) > 0:
             return self._legalize_hard(result, benchmark)
         # Micro-legalization: fix any residual sub-4nm overlaps.

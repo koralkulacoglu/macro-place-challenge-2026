@@ -8,7 +8,8 @@
 - **Key fixes applied**: multi-fidelity Xplace seed search + oSA oracle sync + Adam WL+density + Phase A timeout fix
 - **10-min Docker test results**: ibm06=1.3871 (was 1.4099 ✅), ibm13 started from 1.0604 (was 1.068 ✅), ibm01 Phase A timeout bug fixed
 - **SA now contributes**: oSA oracle sync confirmed working (ibm01: 1.0315 → 1.0258, still improving)
-- **Next**: Full 60-min runs on all 17 benchmarks once ready to submit
+- **DREAMPlace removed**: pipeline now Xplace multi-seed → CT fallback → SA (cleaner, ~250 fewer lines)
+- **Next**: ibm01 Docker validation (v3) to confirm Phase A timeout fix; then full 17-benchmark submission run
 
 ---
 
