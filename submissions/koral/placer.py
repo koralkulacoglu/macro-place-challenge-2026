@@ -72,13 +72,31 @@ def _load_plc(benchmark: Benchmark):
     return None
 
 
+class _WorkerStream:
+    """Prefix every output line with worker ID for interleaved log readability."""
+    def __init__(self, prefix):
+        self._prefix = prefix
+        self._buf    = ""
+        self._real   = sys.__stdout__
+    def write(self, s):
+        self._buf += s
+        while '\n' in self._buf:
+            line, self._buf = self._buf.split('\n', 1)
+            self._real.write(f"{self._prefix}{line}\n")
+        self._real.flush()
+    def flush(self): self._real.flush()
+    def reconfigure(self, **kw): pass
+
+
 def _polish_worker(args):
-    """Module-level worker for parallel SA (fork context on Linux).
+    """Module-level worker for parallel SA (spawn context).
 
     Reloads benchmark + plc from disk so each worker has its own independent
     PlacementCost state. Returns (placement_np, proxy_cost).
     """
     bench_name, placement_np, sa_budget, seed = args
+    worker_id = seed - 42
+    sys.stdout = _WorkerStream(f"[w{worker_id}] ")
     try:
         from macro_place.loader import load_benchmark
         base_ibm = "external/MacroPlacement/Testcases/ICCAD04/" + bench_name
@@ -102,11 +120,11 @@ def _polish_worker(args):
         placer    = KoralPlacer(sa_time_budget=sa_budget, seed=seed)
         result    = placer._cd_lns_polish(placement, bench, plc)
         cost      = compute_proxy_cost(result, bench, plc)["proxy_cost"]
-        print(f"  [worker-s{seed}] done, cost={cost:.4f}", flush=True)
+        print(f"done, cost={cost:.4f}", flush=True)
         return result.numpy(), cost
     except Exception as e:
         import traceback
-        print(f"  [worker-s{seed}] ERROR: {e}\n{traceback.format_exc()}", flush=True)
+        print(f"ERROR: {e}\n{traceback.format_exc()}", flush=True)
         return placement_np, float('inf')
 
 
@@ -200,6 +218,7 @@ class KoralPlacer:
             # filter). Post-SA micro_legalize handles any residual overlaps.
 
         placement = ct_legal  # default: CT positions
+        xpl_tops = None  # top-N Xplace seeds for parallel SA
 
         n_mv_hard = sum(1 for i in range(benchmark.num_hard_macros)
                         if not benchmark.macro_fixed[i])
@@ -229,18 +248,17 @@ class KoralPlacer:
 
             # â”€â”€ Try multi-seed Xplace (routability-driven GP) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             try:
-                xpl = self._run_xplace_multiseed(benchmark, budget, _fast_early, plc)
-                if xpl is not None:
-                    if self._count_hard_overlaps_f32(xpl, benchmark) == 0 and plc is not None:
-                        xpl_cost = compute_proxy_cost(xpl, benchmark, plc)["proxy_cost"]
-                        if xpl_cost < best_ap_cost:
-                            print(f"  [start] Xplace multi-seed {xpl_cost:.4f} < CT {best_ap_cost:.4f} âœ“")
-                            best_ap_cost = xpl_cost
-                            best_placement = xpl
-                        else:
-                            print(f"  [start] Xplace multi-seed {xpl_cost:.4f} >= CT {best_ap_cost:.4f}")
+                xpl_tops = self._run_xplace_multiseed(benchmark, budget, _fast_early, plc)
+                if xpl_tops:
+                    xpl_cost = compute_proxy_cost(xpl_tops[0], benchmark, plc)["proxy_cost"]
+                    if xpl_cost < best_ap_cost:
+                        print(f"  [start] Xplace best={xpl_cost:.4f} < CT {best_ap_cost:.4f}"
+                              f"  top-{len(xpl_tops)} seeds for parallel SA")
+                        best_ap_cost = xpl_cost
+                        best_placement = xpl_tops[0]
                     else:
-                        print(f"  [start] Xplace: overlaps after search, discarded")
+                        print(f"  [start] Xplace best={xpl_cost:.4f} >= CT {best_ap_cost:.4f}, using CT")
+                        xpl_tops = None
             except Exception as e:
                 import traceback
                 print(f"  [start] Xplace multi-seed failed: {e}\n{traceback.format_exc()[-300:]}")
@@ -249,65 +267,32 @@ class KoralPlacer:
             placement = best_placement
 
         if plc is not None and self.sa_time_budget > 0:
-            # Update SA budget to use remaining wall-clock time (minus 15s safety margin).
-            # This ensures GP phases don't silently steal SA time when Xplace runs long.
-            _sa_budget_remaining = max(5.0, budget.remaining() - 15.0)
-            if _sa_budget_remaining < self.sa_time_budget:
-                self.sa_time_budget = _sa_budget_remaining
-            budget.log("SA start", f"sa_budget={self.sa_time_budget:.0f}s")
+            # SA runs for ALL remaining time minus 2-min safety margin.
+            # Workers use spawn context (avoids CUDA+fork deadlock); up to 16 workers
+            # (one per CPU core on judging machine) from top Xplace seeds found above.
+            sa_budget = max(60.0, budget.remaining() - 120.0)
+            budget.log("SA start", f"sa_budget={sa_budget:.0f}s")
 
-            # Parallel SA: spawn N independent workers with different seeds, keep best result.
-            # Uses fork (Linux/Docker only) so workers inherit parent memory without pickling.
-            # Falls back to sequential on Windows (spawn has import-path complexity).
-            #
-            # CUDA + fork deadlock: forking after Xplace used CUDA leaves workers
-            # blocked on futex_wait_queue (background CUDA threads hold locks that the forked
-            # child processes inherit but can never acquire). Fix: use n_workers=1 (sequential,
-            # no fork) when CUDA was active. Sequential SA with full time budget from a good
-            # Xplace starting point is still highly effective.
-            _cuda_was_active = torch.cuda.is_available()
-            n_workers = (min(4, os.cpu_count() or 1)
-                         if sys.platform != 'win32' else 1)
-            if _cuda_was_active and n_workers > 1:
-                n_workers = 1
-                print("  [parallel-SA] CUDA was active â†’ sequential SA (fork+CUDA deadlocks)")
+            _start_positions = [p.numpy() for p in xpl_tops] if xpl_tops else [placement.numpy()]
+            # Cap at 16 (one per core on judging machine); 1 on Windows for local testing
+            n_workers = min(len(_start_positions), 16) if sys.platform != 'win32' else 1
+
             if n_workers > 1:
                 import multiprocessing as _mp
-                print(f"  [parallel-SA] {n_workers} workers, seeds {self.seed}..{self.seed+n_workers-1}")
-                # Worker 0: exact best placement (exploitation).
-                # Workers 1+: increasingly perturbed starts (exploration diversity).
-                # Perturbation ensures workers explore different basins of attraction.
-                _base_np = placement.numpy()
-                _mv_mask = benchmark.get_movable_mask().numpy().astype(bool)
-                _hw_arr = benchmark.macro_sizes[:, 0].numpy() / 2
-                _hh_arr = benchmark.macro_sizes[:, 1].numpy() / 2
-                _cw_f, _ch_f = float(benchmark.canvas_width), float(benchmark.canvas_height)
-                _rng_p = np.random.RandomState(self.seed)
-                args_list = []
-                for i in range(n_workers):
-                    _start = _base_np.copy()
-                    if i > 0:
-                        _sigma = max(_cw_f, _ch_f) * (0.015 * i)  # 1.5%, 3%, 4.5% for workers 1,2,3
-                        for mi in range(benchmark.num_hard_macros):
-                            if _mv_mask[mi]:
-                                _start[mi, 0] = float(np.clip(
-                                    _start[mi, 0] + _rng_p.normal(0, _sigma),
-                                    _hw_arr[mi], _cw_f - _hw_arr[mi]))
-                                _start[mi, 1] = float(np.clip(
-                                    _start[mi, 1] + _rng_p.normal(0, _sigma),
-                                    _hh_arr[mi], _ch_f - _hh_arr[mi]))
-                    args_list.append((benchmark.name, _start, self.sa_time_budget, self.seed + i))
-                ctx = _mp.get_context('fork')
+                print(f"  [parallel-SA] {n_workers} workers, spawn context")
+                ctx = _mp.get_context('spawn')
                 result_q = ctx.Queue()
 
                 def _worker_fn(args):
                     try:
-                        res = _polish_worker(args)
-                        result_q.put(res)
+                        result_q.put(_polish_worker(args))
                     except Exception as e:
-                        print(f"  [worker] error: {e}", flush=True)
                         result_q.put((args[1], float('inf')))
 
+                args_list = [
+                    (benchmark.name, pos_np, sa_budget, self.seed + i)
+                    for i, pos_np in enumerate(_start_positions)
+                ]
                 procs = [ctx.Process(target=_worker_fn, args=(a,)) for a in args_list]
                 for p in procs: p.start()
                 for p in procs: p.join()
@@ -319,8 +304,9 @@ class KoralPlacer:
                         best_cost, best_np = cost, res_np
                 if best_np is not None:
                     placement = torch.from_numpy(best_np)
-                print(f"  [parallel-SA] best cost {best_cost:.4f}")
+                print(f"  [parallel-SA] best={best_cost:.4f}")
             else:
+                self.sa_time_budget = sa_budget
                 placement = self._cd_lns_polish(placement, benchmark, plc, budget=budget)
 
         budget.log("done", f"benchmark={benchmark.name}")
@@ -533,14 +519,17 @@ class KoralPlacer:
             # noise_ratio schedule: coarse → scattered, cycling through on repeat
             # Gives genuine macro arrangement diversity beyond just RNG seed variation.
             _noise_sched = [0.005, 0.025, 0.05, 0.10, 0.15, 0.20]
-            seed_budget = budget.allocate(0.40, max_seconds=700)
-            budget.log("Xplace seeds start", f"budget={seed_budget:.0f}s  "
-                       f"budget-governed  inner_iter=8000  route_force=True")
+            MAX_SEED_SECONDS = 700
+            MIN_SA_SECONDS   = 400
+            budget.log("Xplace seeds start", f"max={MAX_SEED_SECONDS}s  inner_iter=8000")
             seed_t0      = time.time()
             full_results = []  # list of (oracle_cost, seed, pos)
 
             for seed_idx in range(100):   # budget governs actual count
-                if time.time() - seed_t0 >= seed_budget:
+                elapsed_seeds = time.time() - seed_t0
+                if elapsed_seeds >= MAX_SEED_SECONDS:
+                    break
+                if budget.remaining() < MIN_SA_SECONDS + 60:
                     break
                 seed    = self.seed + seed_idx
                 noise_r = _noise_sched[seed_idx % len(_noise_sched)]
@@ -567,34 +556,11 @@ class KoralPlacer:
             if not full_results:
                 print("  [Xplace] no valid seeds")
                 return None
-            budget.log("Xplace seeds done", f"n={len(full_results)}  "
-                       f"best={full_results[0][0]:.4f}  worst={full_results[-1][0]:.4f}")
-
-            # ── Warm oracle SA on top-3 seeds (basin quality check) ──────────
-            phase_C_budget = budget.allocate(0.22, max_seconds=1000)
-            top_full       = full_results[:min(3, len(full_results))]
-            warm_per_seed  = max(20.0, phase_C_budget / len(top_full))
-            budget.log("Xplace warmSA start", f"budget={phase_C_budget:.0f}s  "
-                       f"{warm_per_seed:.0f}s/seed  top_{len(top_full)}")
-            warm_results = []  # list of (warm_cost, seed, warm_pos)
-
-            for oc_gp, seed, pos in top_full:
-                if budget.remaining() < warm_per_seed * 0.5 + 20:
-                    warm_results.append((oc_gp, seed, pos))
-                    print(f"  [Xplace C] seed={seed} skipped warm SA (no time), GP={oc_gp:.4f}")
-                    continue
-                warm_pos, warm_cost = self._run_warm_sa(pos, benchmark, plc,
-                                                         budget_seconds=warm_per_seed)
-                is_best = (not warm_results) or warm_cost < warm_results[0][0]
-                warm_results.append((warm_cost, seed, warm_pos))
-                warm_results.sort(key=lambda x: x[0])
-                print(f"  [Xplace C] seed={seed} warmSA={warm_cost:.4f} (GP={oc_gp:.4f})"
-                      + ("  ← new best!" if is_best else ""))
-
-            warm_results.sort(key=lambda x: x[0])
-            best_cost, best_seed, best_pos = warm_results[0]
-            budget.log("Xplace warmSA done", f"winner_seed={best_seed}  best={best_cost:.4f}")
-            return best_pos
+            top_positions = [pos for (_, _, pos) in full_results[:16]]
+            budget.log("Xplace seeds done",
+                       f"n_seeds={len(full_results)}  best={full_results[0][0]:.4f}  "
+                       f"top={len(top_positions)}")
+            return top_positions
 
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
