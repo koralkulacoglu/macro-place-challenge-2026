@@ -829,16 +829,20 @@ class KoralPlacer:
                        f"inner_iter=500")
             phase_A_t0  = time.time()
             coarse_results = []  # list of (fast_cost, seed, pos)
+            _xpl_time_est = 180.0  # adaptive estimate; starts high for CUDA JIT cold-start
 
             for seed_idx in range(200):
                 if time.time() - phase_A_t0 >= phase_A_budget:
                     break
                 seed     = self.seed + seed_idx
                 time_left_A = phase_A_budget - (time.time() - phase_A_t0)
+                # First seed gets a long timeout for CUDA JIT warm-up (can take 60-120s).
+                # Subsequent seeds use an adaptive estimate based on observed timing × 1.5.
+                _seed_timeout = min(_xpl_time_est * 1.5, max(30.0, time_left_A))
                 pos, elapsed = self._xplace_run_one(
                     benchmark, tmpdir, aux_path, xplace_home, xplace_main,
                     target_density, seed=seed, inner_iter=500,
-                    timeout=min(60.0, time_left_A + 5)
+                    timeout=_seed_timeout
                 )
                 if pos is None:
                     if seed_idx == 0:
@@ -848,6 +852,11 @@ class KoralPlacer:
                 pos = self._legalize_hard(pos, benchmark)
                 if self._count_hard_overlaps_f32(pos, benchmark) > 0:
                     continue
+                # Update timing estimate for adaptive timeout (EMA after first success)
+                if coarse_results:
+                    _xpl_time_est = 0.6 * _xpl_time_est + 0.4 * elapsed
+                else:
+                    _xpl_time_est = elapsed  # first success: set directly
                 fast_cost = float(fast.evaluate(pos)) if fast is not None else float('inf')
                 is_best   = (not coarse_results) or fast_cost < coarse_results[0][0]
                 coarse_results.append((fast_cost, seed, pos))
@@ -1873,6 +1882,54 @@ class KoralPlacer:
                 lns_no_swap_streak += 1
                 if lns_no_swap_streak >= n_mv * 2:
                     break  # explored enough clusters; HPWL-improving swaps exhausted
+
+        # ── Adam WL+density spread: fast autograd pre-step before FD ────────────────
+        # fast.evaluate() only has differentiable WL + density (congestion uses numpy →
+        # zero grad). Adam on WL+density runs 500-1000 steps in 60s vs FD's 6-10 oracle
+        # steps; FD still follows to capture the full congestion-sensitive gradient.
+        # Oracle verifies every 50 Adam steps; reverts if no improvement.
+        if _fast is not None and n_mv >= 1 and deadline - time.time() > 20:
+            _rebuild_state(best_pos, best_ori)
+            _adam_budget = max(10.0, min(60.0, (deadline - time.time()) * 0.08))  # 8% remaining, min 10s
+            _hard_t = torch.tensor(pos[:n_hard].copy(), dtype=torch.float32, requires_grad=True)
+            _soft_t = torch.tensor(pos[n_hard:].copy(), dtype=torch.float32)
+            _adam_opt = torch.optim.Adam([_hard_t], lr=max(cw, ch) * 0.002)
+            _adam_best = best_cost; _adam_best_np = pos.copy()
+            _adam_improved = 0; _adam_step = 0; _adam_t0 = time.time()
+            print(f"  [Adam] WL+density descent, budget={_adam_budget:.0f}s")
+            while time.time() - _adam_t0 < _adam_budget:
+                _full_t = torch.cat([_hard_t, _soft_t], dim=0)
+                _loss = _fast._raw_wl(_full_t) + _fast._raw_density(_full_t[:n_hard])
+                _adam_opt.zero_grad(); _loss.backward(); _adam_opt.step()
+                with torch.no_grad():
+                    for _ami in range(n_hard):
+                        if not movable[_ami]:
+                            _hard_t[_ami, 0] = float(pos[_ami, 0])
+                            _hard_t[_ami, 1] = float(pos[_ami, 1])
+                        else:
+                            _hard_t[_ami, 0].clamp_(float(hw[_ami]), float(cw - hw[_ami]))
+                            _hard_t[_ami, 1].clamp_(float(hh[_ami]), float(ch - hh[_ami]))
+                if _adam_step % 50 == 49:
+                    _trial = pos.copy(); _trial[:n_hard] = _hard_t.detach().numpy()
+                    _trial_t = self._legalize_hard(
+                        torch.tensor(_trial, dtype=torch.float32), benchmark)
+                    if self._count_hard_overlaps_f32(_trial_t, benchmark) == 0:
+                        _oc = compute_proxy_cost(_trial_t, benchmark, plc)["proxy_cost"]
+                        oracle_calls += 1
+                        if _oc < _adam_best:
+                            _adam_best = _oc; _adam_best_np = _trial_t.numpy()
+                            _adam_improved += 1
+                            with torch.no_grad():
+                                _hard_t[:] = torch.tensor(_adam_best_np[:n_hard])
+                            print(f"  [Adam] step={_adam_step} oracle={_oc:.4f}")
+                _adam_step += 1
+            if _adam_best < best_cost:
+                best_cost = _adam_best; best_pos = _adam_best_np
+                pos[:] = best_pos
+                all_cx[:n_mac] = pos[:n_mac, 0]; all_cy[:n_mac] = pos[:n_mac, 1]
+            print(f"  [Adam] {_adam_step} steps, {_adam_improved} improvements, "
+                  f"best={best_cost:.4f} in {time.time()-_adam_t0:.0f}s")
+            _rebuild_state(best_pos, best_ori)
 
         _budget_log("FD start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
