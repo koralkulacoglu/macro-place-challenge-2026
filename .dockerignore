@@ -1,9 +1,38 @@
-# Docker build context exclusions for eval_docker/
+# Root-level .dockerignore — keeps the build context lean.
+# docker build reads this from the repo root (the build context).
+# Only files the Dockerfile actually COPYs need to be included.
+
+# Benchmark data — large, not COPYd into image (provided via bind-mount at runtime)
+external/
+
+# Other submissions
+baselines/
+
+# Dev/test artifacts
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.venv
+**/.vscode
+**/.idea
 .git/
-submissions_eval/
-assets/
-benchmarks/processed/
-eval_docker/results/
+vis/
+results/
+*.log
 *.gif
 *.png
+.claude/
+
+# Docs and scripts not needed in image
+assets/
+benchmarks/
+scripts/
+test/
+src/
+HANDOFF.md
+CLAUDE.md
+SCORING.md
+SETUP.md
+seed_test.py
 os_debug.txt
+uv.lock
