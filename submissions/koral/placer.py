@@ -265,23 +265,39 @@ class KoralPlacer:
             best_placement = ct_legal
             budget.log("CT baseline", f"ct_cost={ct_cost:.4f}")
 
-            # ── Try Xplace (routability-driven GP) ───────────────────────────
+            # ── Early FastEvaluator calibration (for Xplace Phase A seed ranking) ──
+            # Calibrate from CT positions so Phase A can rank 200 seeds in microseconds
+            # rather than spending oracle calls on each seed.
+            _fast_early = None
             try:
-                xpl = self._run_xplace(benchmark)
+                from fast_eval import FastEvaluator as _FE
+                _fast_early = _FE(benchmark, plc)
+                _fe_r = _fast_early.calibrate(benchmark, plc, n_samples=5)
+                if _fe_r < 0.80:
+                    print(f"  [fast_eval] early calibration r={_fe_r:.4f} too low, disabling")
+                    _fast_early = None
+                else:
+                    print(f"  [fast_eval] early calibration r={_fe_r:.4f} (from CT positions)")
+            except Exception as e:
+                print(f"  [fast_eval] early calibration failed: {e}")
+
+            # ── Try multi-seed Xplace (routability-driven GP) ────────────────
+            try:
+                xpl = self._run_xplace_multiseed(benchmark, budget, _fast_early, plc)
                 if xpl is not None:
-                    xpl = self._legalize_hard(xpl, benchmark)
                     if self._count_hard_overlaps_f32(xpl, benchmark) == 0 and plc is not None:
                         xpl_cost = compute_proxy_cost(xpl, benchmark, plc)["proxy_cost"]
                         if xpl_cost < best_ap_cost:
-                            print(f"  [start] Xplace {xpl_cost:.4f} < best {best_ap_cost:.4f} ✓")
+                            print(f"  [start] Xplace multi-seed {xpl_cost:.4f} < CT {best_ap_cost:.4f} ✓")
                             best_ap_cost = xpl_cost
                             best_placement = xpl
                         else:
-                            print(f"  [start] Xplace {xpl_cost:.4f} >= CT {best_ap_cost:.4f}")
+                            print(f"  [start] Xplace multi-seed {xpl_cost:.4f} >= CT {best_ap_cost:.4f}")
                     else:
-                        print(f"  [start] Xplace: overlaps after legalize, discarded")
+                        print(f"  [start] Xplace: overlaps after search, discarded")
             except Exception as e:
-                print(f"  [start] Xplace failed: {e}")
+                import traceback
+                print(f"  [start] Xplace multi-seed failed: {e}\n{traceback.format_exc()[-300:]}")
             budget.log("Xplace done", f"best_gp={best_ap_cost:.4f}")
 
             # ── Try DREAMPlace (WL+density GP) as fallback/complement ────────
@@ -608,172 +624,334 @@ class KoralPlacer:
         placement = self._legalize_hard(placement, benchmark)
         return placement
 
-    def _run_xplace(self, benchmark: Benchmark) -> torch.Tensor:
-        """
-        Run Xplace global placement and return macro positions [num_macros, 2].
-
-        Xplace supports routability-driven placement (unlike DREAMPlace), directly
-        optimizing the congestion component of the proxy cost via routing forces.
-
-        Requires XPLACE_HOME env var and CUDA. Returns None on failure.
-        """
-        import subprocess, os, sys
-
-        # On Linux/Docker, XPLACE_HOME defaults to /opt/xplace.
-        # On Windows (local), Git Bash converts /opt/xplace to a Windows path →
-        # skip cleanly since local Python has no GPU.
+    @staticmethod
+    def _xplace_available():
+        """Return (xplace_home, xplace_main) or (None, None) if unavailable."""
+        import os
         if os.name == 'nt':
-            xplace_home = '/opt/xplace'  # will fail exists check → skip
-        else:
-            xplace_home = os.environ.get('XPLACE_HOME', '/opt/xplace')
+            return None, None  # Windows: no GPU, Git Bash converts paths
+        xplace_home = os.environ.get('XPLACE_HOME', '/opt/xplace')
         xplace_main = os.path.join(xplace_home, 'main.py')
         if not os.path.exists(xplace_main):
-            print(f"  [Xplace] not found at {xplace_main}")
-            return None
-
+            return None, None
         if not torch.cuda.is_available():
-            print("  [Xplace] requires CUDA, skipping")
+            return None, None
+        return xplace_home, xplace_main
+
+    def _xplace_parse_pl(self, pl_path: str, benchmark: Benchmark):
+        """Parse a Bookshelf .pl file → positions tensor, or None on failure."""
+        positions = benchmark.macro_positions.clone().float()
+        macro_sizes = benchmark.macro_sizes.float()
+        parsed = 0
+        try:
+            with open(pl_path) as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 3 or not parts[0].startswith('n'):
+                        continue
+                    idx_str = parts[0][1:]
+                    if not idx_str.isdigit():
+                        continue
+                    idx = int(idx_str)
+                    if idx >= benchmark.num_macros or benchmark.macro_fixed[idx]:
+                        continue
+                    try:
+                        xl_nm, yl_nm = float(parts[1]), float(parts[2])
+                    except ValueError:
+                        continue
+                    w = float(macro_sizes[idx, 0]); h = float(macro_sizes[idx, 1])
+                    cx = max(w/2, min(benchmark.canvas_width  - w/2, xl_nm/1000.0 + w/2.0))
+                    cy = max(h/2, min(benchmark.canvas_height - h/2, yl_nm/1000.0 + h/2.0))
+                    positions[idx, 0] = cx; positions[idx, 1] = cy
+                    parsed += 1
+        except Exception as e:
+            print(f"  [Xplace] pl parse error: {e}")
+            return None
+        if parsed < benchmark.num_hard_macros // 2:
+            print(f"  [Xplace] too few positions ({parsed}), discarding")
+            return None
+        return positions
+
+    def _xplace_run_one(self, benchmark: Benchmark, tmpdir: str, aux_path: str,
+                        xplace_home: str, xplace_main: str, target_density: float,
+                        seed: int, inner_iter: int, timeout: float,
+                        use_route_force: bool = False) -> "tuple[torch.Tensor | None, float]":
+        """Run one Xplace GP. Returns (positions, elapsed_seconds) or (None, elapsed)."""
+        import subprocess, glob as _glob
+        result_dir  = os.path.join(tmpdir, f"results_s{seed}")
+        exp_id      = f"xpl_s{seed}"
+        output_dir  = "out"
+        output_prefix = "placement"
+        os.makedirs(os.path.join(result_dir, exp_id, output_dir), exist_ok=True)
+
+        custom_path = (f"aux:{aux_path},benchmark:ispd2005,design_name:{benchmark.name}")
+        cmd = [
+            sys.executable, xplace_main,
+            "--custom_path",           custom_path,
+            "--load_from_raw",         "True",
+            "--global_placement",      "True",
+            "--legalization",          "False",
+            "--detail_placement",      "False",
+            "--write_placement",       "True",
+            "--write_global_placement","True",
+            "--inner_iter",            str(inner_iter),
+            "--use_filler",            "False",
+            "--noise_ratio",           "0.025",
+            "--target_density",        str(target_density),
+            "--stop_overflow",         "0.05",
+            "--mixed_size",            "True",
+            "--gpu",                   "0",
+            "--num_threads",           "8",
+            "--seed",                  str(seed),
+            "--deterministic",         "True",
+            "--use_route_force",       "True" if use_route_force else "False",
+            "--result_dir",            result_dir,
+            "--exp_id",                exp_id,
+            "--output_dir",            output_dir,
+            "--output_prefix",         output_prefix,
+            "--log_name",              "xplace.log",
+            "--verbose_cpp_log",       "False",
+            "--cpp_log_level",         "2",
+        ]
+        t0 = time.time()
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                cwd=xplace_home,
+                env={**os.environ, "PYTHONPATH": f"{xplace_home}:{os.environ.get('PYTHONPATH', '')}"}
+            )
+            elapsed = time.time() - t0
+            if proc.returncode != 0:
+                tail = (proc.stdout or "")[-400:] + (proc.stderr or "")[-200:]
+                print(f"  [Xplace] seed={seed} failed rc={proc.returncode} in {elapsed:.0f}s: {tail[-100:]}")
+                return None, elapsed
+        except subprocess.TimeoutExpired:
+            return None, float(timeout)
+        except Exception as e:
+            return None, time.time() - t0
+
+        elapsed = time.time() - t0
+        pl_path = os.path.join(result_dir, exp_id, output_dir,
+                               f"{output_prefix}_{benchmark.name}_gp.pl")
+        if not os.path.exists(pl_path):
+            candidates = _glob.glob(os.path.join(result_dir, "**", "*_gp.pl"), recursive=True)
+            if candidates:
+                pl_path = candidates[0]
+            else:
+                return None, elapsed
+
+        positions = self._xplace_parse_pl(pl_path, benchmark)
+        return positions, elapsed
+
+    def _run_warm_sa(self, pos: torch.Tensor, benchmark: Benchmark, plc,
+                     budget_seconds: float = 300.0) -> "tuple[torch.Tensor, float]":
+        """Short oracle SA to assess basin quality. Returns (best_pos, best_cost)."""
+        if plc is None:
+            c = float('inf')
+            return pos, c
+        pos_np = pos.numpy().copy() if isinstance(pos, torch.Tensor) else pos.copy()
+        sizes  = benchmark.macro_sizes.numpy()
+        hw, hh = sizes[:, 0] / 2, sizes[:, 1] / 2
+        n_hard = benchmark.num_hard_macros
+        cw, ch = float(benchmark.canvas_width), float(benchmark.canvas_height)
+        movable      = benchmark.get_movable_mask().numpy()
+        movable_hard = [i for i in range(n_hard) if movable[i]]
+        if not movable_hard:
+            cost = compute_proxy_cost(torch.tensor(pos_np, dtype=torch.float32), benchmark, plc)["proxy_cost"]
+            return pos, cost
+
+        # Precompute separation thresholds for overlap detection
+        sep_x = hw[:n_hard, None] + hw[None, :n_hard]
+        sep_y = hh[:n_hard, None] + hh[None, :n_hard]
+
+        def _ov(i, cx, cy):
+            dx = np.abs(cx - pos_np[:n_hard, 0]); dy = np.abs(cy - pos_np[:n_hard, 1])
+            mask = (dx < sep_x[i]) & (dy < sep_y[i]); mask[i] = False
+            return bool(mask.any())
+
+        best_cost = compute_proxy_cost(torch.tensor(pos_np, dtype=torch.float32), benchmark, plc)["proxy_cost"]
+        best_pos  = pos_np.copy()
+        scale = max(cw, ch) * 0.06
+        T     = best_cost * 0.005
+        t0    = time.time()
+        oracle_count = 1
+
+        while time.time() - t0 < budget_seconds:
+            t_frac    = min(1.0, (time.time() - t0) / budget_seconds)
+            cur_scale = scale * max(0.25, 1.0 - 0.75 * t_frac)
+            T_cur     = T * max(0.01, 1.0 - 0.99 * t_frac)
+            ci = random.choice(movable_hard)
+            cx = float(np.clip(pos_np[ci, 0] + random.gauss(0, cur_scale), hw[ci], cw - hw[ci]))
+            cy = float(np.clip(pos_np[ci, 1] + random.gauss(0, cur_scale), hh[ci], ch - hh[ci]))
+            if _ov(ci, cx, cy):
+                continue
+            old_x, old_y = float(pos_np[ci, 0]), float(pos_np[ci, 1])
+            pos_np[ci, 0] = cx; pos_np[ci, 1] = cy
+            cost = compute_proxy_cost(torch.tensor(pos_np, dtype=torch.float32), benchmark, plc)["proxy_cost"]
+            oracle_count += 1
+            delta = cost - best_cost
+            if delta < 0 or (delta < T_cur and random.random() < math.exp(-delta / max(T_cur, 1e-12))):
+                if cost < best_cost:
+                    best_cost = cost; best_pos = pos_np.copy()
+                    print(f"  [warmSA] t={time.time()-t0:.0f}s oracle={cost:.4f}")
+            else:
+                pos_np[ci, 0] = old_x; pos_np[ci, 1] = old_y
+
+        print(f"  [warmSA] {oracle_count} oracle calls, best={best_cost:.4f} in {time.time()-t0:.0f}s")
+        return torch.tensor(best_pos, dtype=torch.float32), best_cost
+
+    def _run_xplace_multiseed(self, benchmark: Benchmark, budget: "TimeBudget",
+                               fast, plc) -> "torch.Tensor | None":
+        """
+        Multi-fidelity Xplace seed search:
+          Phase A: 100-200 coarse seeds (inner_iter=500, ~5s each) → rank by fast.evaluate
+          Phase B: full GP on top-10 coarse winners (inner_iter=5000) → rank by oracle
+          Phase C: warm oracle SA on top-3 → pick winner by post-warmup oracle cost
+        Returns best positions tensor, or None if Xplace unavailable.
+        """
+        import shutil
+
+        xplace_home, xplace_main = self._xplace_available()
+        if xplace_home is None:
+            print("  [Xplace] not available")
             return None
 
-        # Compute target density from benchmark utilization
-        macro_area = (benchmark.macro_sizes[:, 0] * benchmark.macro_sizes[:, 1]).sum().item()
-        canvas_area = benchmark.canvas_width * benchmark.canvas_height
-        utilization = macro_area / canvas_area
-        target_density = min(0.95, utilization + 0.15)
+        macro_area   = (benchmark.macro_sizes[:, 0] * benchmark.macro_sizes[:, 1]).sum().item()
+        target_density = min(0.95, macro_area / (benchmark.canvas_width * benchmark.canvas_height) + 0.15)
 
-        with tempfile.TemporaryDirectory(prefix=f"koral_{benchmark.name}_xpl_") as tmpdir:
-            # Write bookshelf input (same format as DREAMPlace, reuse existing function)
+        tmpdir = tempfile.mkdtemp(prefix=f"koral_{benchmark.name}_xpl_")
+        try:
             aux_path = write_bookshelf(benchmark, tmpdir, fix_soft=False)
 
-            result_dir = os.path.join(tmpdir, "results")
-            exp_id = "xpl"
-            output_dir = "out"
-            output_prefix = "placement"
-            os.makedirs(os.path.join(result_dir, exp_id, output_dir), exist_ok=True)
+            # ── Phase A: coarse seed sweep ────────────────────────────────────
+            phase_A_budget = budget.allocate(0.25, max_seconds=1000)
+            budget.log("Xplace A start", f"budget={phase_A_budget:.0f}s  up_to_200_seeds  "
+                       f"inner_iter=500")
+            phase_A_t0  = time.time()
+            coarse_results = []  # list of (fast_cost, seed, pos)
 
-            custom_path = (
-                f"aux:{aux_path},"
-                f"benchmark:ispd2005,"
-                f"design_name:{benchmark.name}"
-            )
-
-            cmd = [
-                sys.executable, xplace_main,
-                "--custom_path",          custom_path,
-                "--load_from_raw",        "True",
-                "--global_placement",     "True",
-                "--legalization",         "False",
-                "--detail_placement",     "False",
-                "--write_placement",      "True",
-                "--write_global_placement","True",
-                "--inner_iter",           "5000",
-                "--use_filler",           "False",
-                "--noise_ratio",          "0.025",
-                "--target_density",       str(target_density),
-                "--stop_overflow",        "0.05",
-                "--mixed_size",           "True",
-                "--gpu",                  "0",
-                "--num_threads",          "8",
-                "--seed",                 str(self.seed),
-                "--deterministic",        "True",
-                # Routability force: helps reduce congestion directly
-                "--use_route_force",      "False",   # enable if needed
-                "--result_dir",           result_dir,
-                "--exp_id",               exp_id,
-                "--output_dir",           output_dir,
-                "--output_prefix",        output_prefix,
-                "--log_name",             "xplace.log",
-                "--verbose_cpp_log",      "False",
-                "--cpp_log_level",        "2",
-            ]
-
-            print(f"  [Xplace] running GP on {benchmark.name}...")
-            t0 = time.time()
-            try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=600,
-                    cwd=xplace_home,  # Run from xplace_home so thirdparty/flute/POWV9.dat resolves
-                    env={**os.environ, "PYTHONPATH": f"{xplace_home}:{os.environ.get('PYTHONPATH', '')}"}
+            for seed_idx in range(200):
+                if time.time() - phase_A_t0 >= phase_A_budget:
+                    break
+                seed     = self.seed + seed_idx
+                time_left_A = phase_A_budget - (time.time() - phase_A_t0)
+                pos, elapsed = self._xplace_run_one(
+                    benchmark, tmpdir, aux_path, xplace_home, xplace_main,
+                    target_density, seed=seed, inner_iter=500,
+                    timeout=min(60.0, time_left_A + 5)
                 )
-                elapsed = time.time() - t0
-                if proc.returncode != 0:
-                    print(f"  [Xplace] failed (rc={proc.returncode}) in {elapsed:.0f}s")
-                    out_tail = (proc.stdout or "")[-800:]
-                    err_tail = (proc.stderr or "")[-400:]
-                    if out_tail:
-                        print(f"  [Xplace] stdout tail: {out_tail}")
-                    if err_tail:
-                        print(f"  [Xplace] stderr: {err_tail}")
-                    return None
+                if pos is None:
+                    if seed_idx == 0:
+                        print(f"  [Xplace A] first seed failed — Xplace not working, aborting")
+                        return None
+                    continue
+                pos = self._legalize_hard(pos, benchmark)
+                if self._count_hard_overlaps_f32(pos, benchmark) > 0:
+                    continue
+                fast_cost = float(fast.evaluate(pos)) if fast is not None else float('inf')
+                is_best   = (not coarse_results) or fast_cost < coarse_results[0][0]
+                coarse_results.append((fast_cost, seed, pos))
+                coarse_results.sort(key=lambda x: x[0])
+                print(f"  [Xplace A] seed={seed} fast={fast_cost:.4f} {elapsed:.0f}s"
+                      f"  ({len(coarse_results)} ok)" + ("  ← new best!" if is_best else ""))
+
+            if not coarse_results:
+                print("  [Xplace A] no valid coarse results")
+                return None
+            budget.log("Xplace A done", f"seeds={len(coarse_results)}  "
+                       f"best_fast={coarse_results[0][0]:.4f}  "
+                       f"worst_fast={coarse_results[-1][0]:.4f}")
+
+            # ── Phase B: full GP on top-10 coarse winners ─────────────────────
+            phase_B_budget = budget.allocate(0.18, max_seconds=600)
+            top_coarse     = coarse_results[:min(10, len(coarse_results))]
+            budget.log("Xplace B start", f"budget={phase_B_budget:.0f}s  "
+                       f"full_GP on top_{len(top_coarse)}_seeds  inner_iter=5000")
+            phase_B_t0  = time.time()
+            full_results = []  # list of (oracle_cost, seed, pos)
+
+            for fast_cost_c, seed, pos_coarse in top_coarse:
+                time_left_B = phase_B_budget - (time.time() - phase_B_t0)
+                if time_left_B < 20:
+                    # No time for full GP; use coarse result with oracle eval
+                    if plc is not None:
+                        oc = compute_proxy_cost(pos_coarse, benchmark, plc)["proxy_cost"]
+                    else:
+                        oc = fast_cost_c
+                    full_results.append((oc, seed, pos_coarse))
+                    print(f"  [Xplace B] seed={seed} time up, using coarse oracle={oc:.4f}")
+                    continue
+                pos, elapsed = self._xplace_run_one(
+                    benchmark, tmpdir, aux_path, xplace_home, xplace_main,
+                    target_density, seed=seed, inner_iter=5000,
+                    timeout=min(180.0, time_left_B + 5)
+                )
+                if pos is None:
+                    pos = pos_coarse  # fall back to coarse result
+                pos = self._legalize_hard(pos, benchmark)
+                if self._count_hard_overlaps_f32(pos, benchmark) > 0:
+                    continue
+                oc = compute_proxy_cost(pos, benchmark, plc)["proxy_cost"] if plc else fast_cost_c
+                is_best = (not full_results) or oc < full_results[0][0]
+                full_results.append((oc, seed, pos))
+                full_results.sort(key=lambda x: x[0])
+                print(f"  [Xplace B] seed={seed} oracle={oc:.4f} (coarse_fast={fast_cost_c:.4f})"
+                      f" {elapsed:.0f}s" + ("  ← new best!" if is_best else ""))
+
+            if not full_results:
+                print("  [Xplace B] no valid full results, using best coarse")
+                fc, fs, fp = coarse_results[0]
+                return fp
+            budget.log("Xplace B done", f"seeds={len(full_results)}  "
+                       f"best_oracle={full_results[0][0]:.4f}")
+
+            # ── Phase C: warm oracle SA on top-3 ─────────────────────────────
+            phase_C_budget = budget.allocate(0.22, max_seconds=1000)
+            top_full       = full_results[:min(3, len(full_results))]
+            warm_per_seed  = max(20.0, phase_C_budget / len(top_full))
+            budget.log("Xplace C start", f"budget={phase_C_budget:.0f}s  "
+                       f"{warm_per_seed:.0f}s/seed  top_{len(top_full)}")
+            warm_results = []  # list of (warm_cost, seed, warm_pos)
+
+            for oc_gp, seed, pos in top_full:
+                if budget.remaining() < warm_per_seed * 0.5 + 20:
+                    warm_results.append((oc_gp, seed, pos))
+                    print(f"  [Xplace C] seed={seed} skipped warm SA (no time), GP={oc_gp:.4f}")
+                    continue
+                warm_pos, warm_cost = self._run_warm_sa(pos, benchmark, plc,
+                                                         budget_seconds=warm_per_seed)
+                is_best = (not warm_results) or warm_cost < warm_results[0][0]
+                warm_results.append((warm_cost, seed, warm_pos))
+                warm_results.sort(key=lambda x: x[0])
+                print(f"  [Xplace C] seed={seed} warmSA={warm_cost:.4f} (GP={oc_gp:.4f})"
+                      + ("  ← new best!" if is_best else ""))
+
+            warm_results.sort(key=lambda x: x[0])
+            best_cost, best_seed, best_pos = warm_results[0]
+            budget.log("Xplace C done", f"winner_seed={best_seed}  best={best_cost:.4f}")
+            return best_pos
+
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _run_xplace(self, benchmark: Benchmark) -> torch.Tensor:
+        """Single-seed Xplace GP (backward-compat wrapper). Prefer _run_xplace_multiseed."""
+        xplace_home, xplace_main = self._xplace_available()
+        if xplace_home is None:
+            print("  [Xplace] not available")
+            return None
+        macro_area     = (benchmark.macro_sizes[:, 0] * benchmark.macro_sizes[:, 1]).sum().item()
+        target_density = min(0.95, macro_area / (benchmark.canvas_width * benchmark.canvas_height) + 0.15)
+        with tempfile.TemporaryDirectory(prefix=f"koral_{benchmark.name}_xpl_") as tmpdir:
+            aux_path = write_bookshelf(benchmark, tmpdir, fix_soft=False)
+            print(f"  [Xplace] running GP on {benchmark.name} (seed={self.seed})...")
+            pos, elapsed = self._xplace_run_one(
+                benchmark, tmpdir, aux_path, xplace_home, xplace_main,
+                target_density, seed=self.seed, inner_iter=5000, timeout=600
+            )
+            if pos is not None:
                 print(f"  [Xplace] completed in {elapsed:.0f}s")
-            except subprocess.TimeoutExpired:
-                print("  [Xplace] timed out")
-                return None
-            except Exception as e:
-                print(f"  [Xplace] error: {e}")
-                return None
-
-            # Find output .pl file
-            pl_path = os.path.join(result_dir, exp_id, output_dir,
-                                   f"{output_prefix}_{benchmark.name}_gp.pl")
-            if not os.path.exists(pl_path):
-                # Try alternate naming (Xplace uses exp_id with timestamp sometimes)
-                import glob
-                candidates = glob.glob(os.path.join(result_dir, "**", "*_gp.pl"), recursive=True)
-                if candidates:
-                    pl_path = candidates[0]
-                    print(f"  [Xplace] found pl at: {pl_path}")
-                else:
-                    print(f"  [Xplace] output .pl not found at {pl_path}")
-                    return None
-
-            # Parse Bookshelf .pl file → positions tensor
-            # Format: "n{idx} x_nm y_nm : N" (lower-left coords in nm)
-            positions = benchmark.macro_positions.clone().float()
-            macro_sizes = benchmark.macro_sizes.float()
-            parsed = 0
-            try:
-                with open(pl_path) as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) < 3:
-                            continue
-                        name = parts[0]
-                        if not name.startswith('n'):
-                            continue
-                        idx_str = name[1:]
-                        if not idx_str.isdigit():
-                            continue
-                        idx = int(idx_str)
-                        if idx >= benchmark.num_macros:
-                            continue
-                        if benchmark.macro_fixed[idx]:
-                            continue
-                        try:
-                            xl_nm = float(parts[1])
-                            yl_nm = float(parts[2])
-                        except ValueError:
-                            continue
-                        # Convert lower-left nm → center μm
-                        w, h = float(macro_sizes[idx, 0]), float(macro_sizes[idx, 1])
-                        cx = xl_nm / 1000.0 + w / 2.0
-                        cy = yl_nm / 1000.0 + h / 2.0
-                        # Clamp to canvas
-                        cx = max(w/2, min(benchmark.canvas_width  - w/2, cx))
-                        cy = max(h/2, min(benchmark.canvas_height - h/2, cy))
-                        positions[idx, 0] = cx
-                        positions[idx, 1] = cy
-                        parsed += 1
-            except Exception as e:
-                print(f"  [Xplace] pl parse error: {e}")
-                return None
-
-            print(f"  [Xplace] parsed {parsed} macro positions")
-            if parsed < benchmark.num_hard_macros // 2:
-                print(f"  [Xplace] too few positions parsed, discarding")
-                return None
-
-            return positions
+            return pos
 
     # ── Post-DREAMPlace legalization ──────────────────────────────────────────
 
