@@ -2,11 +2,12 @@
 
 **Deadline: May 21, 2026 | Prize: $49K | Submission: https://forms.gle/YDRtYV5Vq68SZgKW9**
 
-## Current Status (2026-05-18 Session 3, End of Day)
+## Current Status (2026-05-19 Session 4)
 
 - **Branch**: `strategy-may18`
-- **Key achievement**: Xplace integration working — 10-22% improvement per benchmark over CT
-- **Active runs**: ibm01, ibm03, ibm04, ibm06, ibm09 in Docker with Xplace+SA
+- **Key discovery**: SA contributes ~0 improvement — fast evaluator drifts in oSA, all candidates oracle-rejected
+- **Completed runs**: ibm01=0.9099, ibm03=1.1758, ibm04=1.1106, ibm06=1.4099, ibm09=0.9506 (all = Xplace GP score)
+- **Active work**: `TimeBudget` + multi-fidelity Xplace seed search + oSA oracle sync fix
 
 ---
 

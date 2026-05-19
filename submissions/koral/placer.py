@@ -162,6 +162,45 @@ def _polish_worker(args):
         return placement_np, float('inf')
 
 
+# ── Time budget tracker ──────────────────────────────────────────────────────
+
+class TimeBudget:
+    """Tracks total wall-clock budget across all placement phases.
+
+    Usage:
+        budget = TimeBudget(3540)
+        budget.log("Xplace done", f"best={cost:.4f}")
+        sa_seconds = budget.allocate(0.50)  # 50% of remaining
+    """
+
+    def __init__(self, total_seconds: float):
+        self._t0 = time.time()
+        self.total = total_seconds
+
+    def elapsed(self) -> float:
+        return time.time() - self._t0
+
+    def remaining(self) -> float:
+        return max(0.0, self.total - self.elapsed())
+
+    def pct(self) -> float:
+        return min(100.0, self.elapsed() / self.total * 100.0)
+
+    def allocate(self, fraction: float, max_seconds: float = None) -> float:
+        alloc = self.remaining() * fraction
+        if max_seconds is not None:
+            alloc = min(alloc, max_seconds)
+        return max(0.0, alloc)
+
+    def log(self, phase: str, extra: str = ""):
+        r = self.remaining()
+        e = self.elapsed()
+        parts = [f"  [budget] {phase}: elapsed={e:.0f}s  remaining={r:.0f}s  ({self.pct():.0f}% used)"]
+        if extra:
+            parts.append(f"  {extra}")
+        print("".join(parts))
+
+
 # ── Main placer ───────────────────────────────────────────────────────────────
 
 class KoralPlacer:
@@ -183,6 +222,14 @@ class KoralPlacer:
         torch.manual_seed(self.seed)
         random.seed(self.seed)
         np.random.seed(self.seed)
+
+        # Total wall-clock budget (KORAL_TOTAL_BUDGET overrides; default = SA_BUDGET + 120s for GP phases)
+        _total_budget = float(os.environ.get(
+            "KORAL_TOTAL_BUDGET",
+            str(self.sa_time_budget + 120)
+        ))
+        budget = TimeBudget(_total_budget)
+        budget.log("start", f"benchmark={benchmark.name}  total={_total_budget:.0f}s")
 
         plc = _load_plc(benchmark)
 
@@ -216,6 +263,7 @@ class KoralPlacer:
             ct_cost = compute_proxy_cost(ct_legal, benchmark, plc)["proxy_cost"] if plc else float('inf')
             best_ap_cost = ct_cost
             best_placement = ct_legal
+            budget.log("CT baseline", f"ct_cost={ct_cost:.4f}")
 
             # ── Try Xplace (routability-driven GP) ───────────────────────────
             try:
@@ -234,6 +282,7 @@ class KoralPlacer:
                         print(f"  [start] Xplace: overlaps after legalize, discarded")
             except Exception as e:
                 print(f"  [start] Xplace failed: {e}")
+            budget.log("Xplace done", f"best_gp={best_ap_cost:.4f}")
 
             # ── Try DREAMPlace (WL+density GP) as fallback/complement ────────
             if _dreamplace_available():
@@ -251,10 +300,18 @@ class KoralPlacer:
                             print(f"  [start] DREAMPlace(center-init) {dp_cost:.4f} >= best {best_ap_cost:.4f}")
                 except Exception as e:
                     print(f"  [start] DREAMPlace(center-init) failed: {e}")
+                budget.log("DREAMPlace done", f"best_gp={best_ap_cost:.4f}")
 
             placement = best_placement
 
         if plc is not None and self.sa_time_budget > 0:
+            # Update SA budget to use remaining wall-clock time (minus 15s safety margin).
+            # This ensures GP phases don't silently steal SA time when Xplace runs long.
+            _sa_budget_remaining = max(5.0, budget.remaining() - 15.0)
+            if _sa_budget_remaining < self.sa_time_budget:
+                self.sa_time_budget = _sa_budget_remaining
+            budget.log("SA start", f"sa_budget={self.sa_time_budget:.0f}s")
+
             # Parallel SA: spawn N independent workers with different seeds, keep best result.
             # Uses fork (Linux/Docker only) so workers inherit parent memory without pickling.
             # Falls back to sequential on Windows (spawn has import-path complexity).
@@ -320,8 +377,9 @@ class KoralPlacer:
                     placement = torch.from_numpy(best_np)
                 print(f"  [parallel-SA] best cost {best_cost:.4f}")
             else:
-                placement = self._cd_lns_polish(placement, benchmark, plc)
+                placement = self._cd_lns_polish(placement, benchmark, plc, budget=budget)
 
+        budget.log("done", f"benchmark={benchmark.name}")
         return placement
 
     # ── DREAMPlace stage ──────────────────────────────────────────────────────
@@ -1152,6 +1210,7 @@ class KoralPlacer:
         placement: torch.Tensor,
         benchmark: Benchmark,
         plc,
+        budget: "TimeBudget | None" = None,
     ) -> torch.Tensor:
         """
         Coordinate descent + LNS polish on hard macros.
@@ -1449,6 +1508,15 @@ class KoralPlacer:
         pass_num = 0
         no_improve_streak = 0
 
+        def _budget_log(phase: str, extra: str = ""):
+            if budget is not None:
+                budget.log(phase, extra)
+            else:
+                remaining = max(0.0, deadline - time.time())
+                print(f"  [budget] {phase}: remaining={remaining:.0f}s  {extra}")
+
+        _budget_log("CD start", f"initial={best_cost:.4f}  wl_frac={_wl_frac:.1%}")
+
         # ── Coordinate Descent ────────────────────────────────────────────────
         while time.time() < deadline:
             frac = max(0.0, (deadline - time.time()) / self.sa_time_budget)
@@ -1509,6 +1577,8 @@ class KoralPlacer:
                     break  # HPWL gradient not correlated with proxy; stop wasting oracle calls
 
             pass_num += 1
+
+        _budget_log("LNS start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
         # ── LNS: pairwise swaps in spatial clusters ───────────────────────────
         # _overlaps_excl: check if macro i at (cx,cy) overlaps anything except macro excl
@@ -1626,6 +1696,8 @@ class KoralPlacer:
                 if lns_no_swap_streak >= n_mv * 2:
                     break  # explored enough clusters; HPWL-improving swaps exhausted
 
+        _budget_log("FD start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
+
         # ── FD gradient descent (targets congestion/density, blind to HPWL gradient) ──
         # For each of the top-k congested macros: compute ∂proxy/∂x and ∂proxy/∂y via
         # 1-sided FD (probe at pos+δ, compare to best_cost). Apply normalized gradient
@@ -1722,6 +1794,8 @@ class KoralPlacer:
             if fd_step > 0:
                 print(f"  [FD] {fd_improved}/{fd_step} steps improved, best={best_cost:.4f}")
             _rebuild_state(best_pos, best_ori)
+
+        _budget_log("hSA start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
         # ── HPWL-guided SA with periodic oracle checkpoints ──────────────────────
         # Uses HPWL as fast surrogate (O(degree), ~0.01ms/call) for SA acceptance,
@@ -1920,6 +1994,8 @@ class KoralPlacer:
             if hsa_oracle > 0:
                 print(f"  [hSA] {hsa_improved} improved, {hsa_accepted}/{hsa_step} accepted, "
                       f"{hsa_oracle} oracle, swap={'on' if _hsa_swap_enabled else 'off'}")
+
+        _budget_log("oSA start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
         # ── Oracle SA tail: direct proxy minimization with remaining time ─────
         # hSA uses HPWL surrogate which doesn't correlate for congestion-dominated
@@ -2262,7 +2338,7 @@ class KoralPlacer:
         else:
             print(f"  [soft] update no gain ({soft_cost:.4f} >= {best_cost:.4f}), kept CT positions")
 
-        print(f"  [CD] final={best_cost:.4f} ({oracle_calls} oracle calls, {pass_num} passes)")
+        _budget_log("SA done", f"final={best_cost:.4f}  oracle_calls={oracle_calls}  passes={pass_num}")
         result = torch.tensor(best_pos, dtype=torch.float32)
         # Full legalization if significant (>4nm) overlaps remain (e.g. after DREAMPlace).
         if self._count_significant_overlaps(result, benchmark, threshold=0.004) > 0:
