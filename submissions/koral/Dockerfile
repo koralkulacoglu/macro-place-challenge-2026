@@ -1,74 +1,54 @@
-# Macro Placement Challenge — koral submission
+# Macro Placement Challenge 2026 — koral submission
 #
-# Build (from repo root):
+# Pipeline: Xplace multi-seed GP (top-16 seeds) → 16 parallel SA workers
+# Requires: CUDA GPU at runtime (Xplace uses GPU for routability-driven GP)
+#
+# ── Build (from repo root, submodule must be initialized) ─────────────────
+#   git submodule update --init external/MacroPlacement
 #   docker build -t koral-placer -f submissions/koral/Dockerfile .
 #
-# Dev loop (bind-mount repo, GPU passthrough):
-#   docker run --rm --runtime=nvidia --gpus all -v $(pwd):/challenge \
-#     --entrypoint python koral-placer \
-#     -m macro_place.evaluate submissions/koral/placer.py -b ibm01
+# ── Run a single benchmark ────────────────────────────────────────────────
+#   docker run --rm --runtime=nvidia --gpus all \
+#     -v $(pwd):/challenge --network none \
+#     koral-placer submissions/koral/placer.py -b ibm01
+#
+# ── Run all 17 IBM benchmarks (full judging run) ──────────────────────────
+#   docker run --rm --runtime=nvidia --gpus all \
+#     -v $(pwd):/challenge --network none \
+#     koral-placer submissions/koral/placer.py --all
+#
+# Note: Xplace requires CUDA JIT compilation on first run (~60-120s cold start).
+#       Each benchmark runs for ~60 min: ~700s Xplace seed search + ~2800s parallel SA.
 
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV PATH="/usr/local/cuda/bin:${PATH}"
+ENV CUDA_HOME=/usr/local/cuda
 
-# Build deps
+SHELL ["/bin/bash", "-c"]
+
+# ── System build dependencies ─────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake bison flex libfl-dev libboost-all-dev libcairo2-dev \
+        cmake bison flex libfl-dev libboost-all-dev \
         build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /challenge
 
-# Use bash for all subsequent RUN commands (dash default doesn't support pipefail)
-SHELL ["/bin/bash", "-c"]
-
-# Challenge framework
+# ── Challenge framework ───────────────────────────────────────────────────
 COPY macro_place /challenge/macro_place
 COPY pyproject.toml requirements.txt /challenge/
 RUN pip install --no-cache-dir -e . && pip install --no-cache-dir scipy tqdm
 
-# Python deps DREAMPlace needs at runtime
-RUN pip install --no-cache-dir \
-        pyunpack patool cairocffi pkgconfig shapely \
-        torch_optimizer ncg_optimizer
-
-# Clone DREAMPlace (network is available at build time; --network none is runtime-only)
-ENV PATH="/usr/local/cuda/bin:${PATH}"
-ENV CUDA_HOME=/usr/local/cuda
-RUN git clone --depth=1 --recursive https://github.com/limbo018/DREAMPlace.git /tmp/dreamplace_src
-
-# Apply compatibility patches (CUDA 12.4 / NumPy 2.0 / detailed-placement disabled)
-COPY submissions/koral/patch_dreamplace.sh /tmp/patch_dreamplace.sh
-# Strip Windows CRLF line endings that git adds on Windows hosts before running on Linux
-RUN sed -i 's/\r$//' /tmp/patch_dreamplace.sh && bash /tmp/patch_dreamplace.sh /tmp/dreamplace_src
-
-# Make libcuda.so stub visible so cmake's find_package(CUDA) succeeds without a GPU device
-RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so
-
-# Build and install DREAMPlace into /opt so bind-mounts on /challenge don't shadow it
-RUN cd /tmp/dreamplace_src \
-    && mkdir build && cd build \
-    && cmake .. \
-        -DCMAKE_INSTALL_PREFIX=/opt/dreamplace \
-        -DCUDA_ARCHITECTURES="8.0;8.6;8.9;9.0" \
-        -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
-        -DCMAKE_BUILD_TYPE=Release \
-    && make -j$(nproc) \
-    && make install \
-    && rm -rf /tmp/dreamplace_src /tmp/patch_dreamplace.sh
-
-# DREAMPlace at /opt so bind-mounts on /challenge don't shadow it
-ENV PYTHONPATH=/opt/dreamplace:/opt/dreamplace/dreamplace
-
-# ── Xplace: routability-driven analytical placer (rank-1 team uses this) ──
-# Xplace supports ISPD2005 Bookshelf format (same as DREAMPlace), adds
-# routing congestion force that DREAMPlace lacks. Requires CUDA at runtime.
+# ── Xplace: routability-driven analytical placer ──────────────────────────
+# Needs a GPU at runtime; CUDA JIT compiles kernels on first use (~60-120s).
 RUN git clone --depth=1 --recurse-submodules \
         https://github.com/cuhk-eda/Xplace.git /tmp/xplace_src \
     && cd /tmp/xplace_src \
-    && pip install --no-cache-dir pandas loguru \
+    && pip install --no-cache-dir pandas loguru seaborn matplotlib \
+                                   scipy numba torchvision pulp igraph \
     && sed -i \
         's/int(torch.cuda.is_available())/int(torch.version.cuda is not None)/' \
         CMakeLists.txt \
@@ -80,31 +60,32 @@ RUN git clone --depth=1 --recurse-submodules \
         -DPYTHON_EXECUTABLE=$(which python3) \
     && make -j$(nproc) \
     && make install \
-    && cp -r /tmp/xplace_src/src /opt/xplace/src \
-    && cp -r /tmp/xplace_src/utils /opt/xplace/utils \
-    && cp /tmp/xplace_src/main.py /opt/xplace/main.py \
+    && cp -r /tmp/xplace_src/src      /opt/xplace/src \
+    && cp -r /tmp/xplace_src/utils    /opt/xplace/utils \
+    && cp    /tmp/xplace_src/main.py  /opt/xplace/main.py \
     && cp -r /tmp/xplace_src/cpp_to_py /opt/xplace/cpp_to_py \
     && mkdir -p /opt/xplace/thirdparty/flute \
     && cp /tmp/xplace_src/thirdparty/flute/POWV9.dat /opt/xplace/thirdparty/flute/ \
     && cp /tmp/xplace_src/thirdparty/flute/POST9.dat /opt/xplace/thirdparty/flute/ \
     && rm -rf /tmp/xplace_src
 
-# Xplace Python runtime deps + NumPy 2.0 compatibility patches
-RUN pip install --no-cache-dir seaborn matplotlib scipy numba torchvision pulp igraph pandas loguru \
-    && sed -i 's/np\.round_/np.round/g' /opt/xplace/src/core/macro_legalization.py \
+# NumPy 2.0 compatibility patches for Xplace
+RUN sed -i 's/np\.round_/np.round/g'    /opt/xplace/src/core/macro_legalization.py \
     && sed -i 's/dtype=np\.bool8/dtype=np.bool_/g' /opt/xplace/src/core/macro_legalization.py
 
 ENV XPLACE_HOME=/opt/xplace
-ENV PYTHONPATH=/opt/xplace:/opt/dreamplace:/opt/dreamplace/dreamplace
+ENV PYTHONPATH=/opt/xplace
 
-# Benchmarks (baked in for self-contained image; judges mount their own)
-COPY external/MacroPlacement/Testcases/ICCAD04 /challenge/external/MacroPlacement/Testcases/ICCAD04
-COPY external/MacroPlacement/CodeElements/Plc_client /challenge/external/MacroPlacement/CodeElements/Plc_client
+# ── Benchmarks (baked in; judges may also bind-mount their own copy) ──────
+COPY external/MacroPlacement/Testcases/ICCAD04 \
+     /challenge/external/MacroPlacement/Testcases/ICCAD04
+COPY external/MacroPlacement/CodeElements/Plc_client \
+     /challenge/external/MacroPlacement/CodeElements/Plc_client
 
-# Our submission code
+# ── Submission code ───────────────────────────────────────────────────────
 RUN mkdir -p /challenge/submissions/koral
 COPY submissions/koral/placer.py    /challenge/submissions/koral/placer.py
 COPY submissions/koral/bookshelf.py /challenge/submissions/koral/bookshelf.py
 COPY submissions/koral/fast_eval.py /challenge/submissions/koral/fast_eval.py
 
-ENTRYPOINT ["python", "-m", "macro_place.evaluate"]
+ENTRYPOINT ["python3", "-m", "macro_place.evaluate"]
