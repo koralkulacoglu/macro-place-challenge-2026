@@ -10,8 +10,11 @@ XPLACE = Path("/opt/xplace")
 
 def patch(path: Path, old: str, new: str):
     txt = path.read_text()
+    if new in txt:
+        print(f"  [SKIP] {path.name}: already applied")
+        return
     if old not in txt:
-        print(f"  [SKIP] {path.name}: marker not found (already patched?)")
+        print(f"  [SKIP] {path.name}: marker not found")
         return
     path.write_text(txt.replace(old, new, 1))
     print(f"  [OK]   {path.name} patched")

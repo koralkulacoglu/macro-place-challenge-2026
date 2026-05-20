@@ -192,6 +192,8 @@ class TimeBudget:
 # â”€â”€ Main placer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class KoralPlacer:
+    _xplace_patched: bool = False  # class-level guard: apply RUDY patches only once per process
+
     def __init__(
         self,
         target_density: float = 0.0,     # 0 = auto from utilization
@@ -208,9 +210,10 @@ class KoralPlacer:
         self.seed            = seed
         self.rudy_weight     = rudy_weight
 
-        # Apply Xplace RUDY patches at startup when enabled (idempotent).
-        # Also copies the latest rudy_loss.py in case the image has a stale version.
-        if rudy_weight > 0:
+        # Apply Xplace RUDY patches once per process (idempotent on disk too).
+        # Guard prevents re-patching when KoralPlacer is re-instantiated per benchmark.
+        if rudy_weight > 0 and not KoralPlacer._xplace_patched:
+            KoralPlacer._xplace_patched = True
             _patch = Path(__file__).parent / "xplace_patches" / "apply_patches.py"
             _rudy  = Path(__file__).parent / "xplace_patches" / "rudy_loss.py"
             _xhome = Path(os.environ.get("XPLACE_HOME", "/opt/xplace"))
