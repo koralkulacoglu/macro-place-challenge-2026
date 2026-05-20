@@ -197,14 +197,16 @@ class KoralPlacer:
         target_density: float = 0.0,     # 0 = auto from utilization
         density_weight: float = 8e-5,
         gamma: float = 4.0,
-        sa_time_budget: int = int(os.environ.get("KORAL_SA_BUDGET", "3480")),  
+        sa_time_budget: int = int(os.environ.get("KORAL_SA_BUDGET", "3480")),
         seed: int = 42,
+        rudy_weight: float = float(os.environ.get("KORAL_RUDY_WEIGHT", "0.5")),
     ):
         self.target_density  = target_density
         self.density_weight  = density_weight
         self.gamma           = gamma
         self.sa_time_budget  = sa_time_budget
         self.seed            = seed
+        self.rudy_weight     = rudy_weight
 
         # Pre-fork SA worker pool BEFORE any CUDA usage.
         # Fork here while CUDA is clean; workers loop accepting tasks from successive benchmarks.
@@ -447,6 +449,8 @@ class KoralPlacer:
             "--seed",                  str(seed),
             "--deterministic",         "True",
             "--use_route_force",       "True" if use_route_force else "False",
+            "--rudy_weight",           str(self.rudy_weight),
+            "--rudy_start_iter",       "1000",
             "--result_dir",            result_dir,
             "--exp_id",                exp_id,
             "--output_dir",            output_dir,

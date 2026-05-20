@@ -72,6 +72,11 @@ RUN git clone --depth=1 --recurse-submodules \
 RUN sed -i 's/np\.round_/np.round/g'    /opt/xplace/src/core/macro_legalization.py \
     && sed -i 's/dtype=np\.bool8/dtype=np.bool_/g' /opt/xplace/src/core/macro_legalization.py
 
+# Differentiable RUDY congestion gradient (bypasses gpugr, pure PyTorch)
+COPY submissions/koral/xplace_patches/rudy_loss.py    /opt/xplace/src/core/rudy_loss.py
+COPY submissions/koral/xplace_patches/apply_patches.py /tmp/apply_patches.py
+RUN python3 /tmp/apply_patches.py && rm /tmp/apply_patches.py
+
 ENV XPLACE_HOME=/opt/xplace
 ENV PYTHONPATH=/opt/xplace
 
