@@ -64,26 +64,29 @@ def _build_demand_map(conn_node_pos, data):
     if data.net_mask is not None:
         hpwl = hpwl * data.net_mask.to(dtype=dtype)
 
-    cx  = (x_max + x_min) * 0.5
-    cy  = (y_max + y_min) * 0.5
-    bx  = ((cx - lx) / bin_w - 0.5).clamp(0.0, nbx - 1.001)
-    by_ = ((cy - ly) / bin_h - 0.5).clamp(0.0, nby - 1.001)
-    bx0 = bx.long().clamp(0, nbx - 1)
-    by0 = by_.long().clamp(0, nby - 1)
-    bx1 = (bx0 + 1).clamp(0, nbx - 1)
-    by1 = (by0 + 1).clamp(0, nby - 1)
-    fx  = (bx  - bx0.to(dtype=dtype)).clamp(0.0, 1.0)
-    fy  = (by_ - by0.to(dtype=dtype)).clamp(0.0, 1.0)
-    i00 = (bx0 * nby + by0).clamp(0, nbx * nby - 1)
-    i01 = (bx0 * nby + by1).clamp(0, nbx * nby - 1)
-    i10 = (bx1 * nby + by0).clamp(0, nbx * nby - 1)
-    i11 = (bx1 * nby + by1).clamp(0, nbx * nby - 1)
-
+    # Scatter HPWL/4 to each bbox corner — where routes actually start/end.
+    # Nets with overlapping bboxes create high demand at shared corners,
+    # giving a more accurate congestion map than scattering to net center.
     density_flat = torch.zeros(nbx * nby, device=device, dtype=dtype)
-    density_flat.scatter_add_(0, i00, hpwl * (1.0 - fx) * (1.0 - fy))
-    density_flat.scatter_add_(0, i01, hpwl * (1.0 - fx) * fy)
-    density_flat.scatter_add_(0, i10, hpwl * fx * (1.0 - fy))
-    density_flat.scatter_add_(0, i11, hpwl * fx * fy)
+    corner_w = hpwl * 0.25
+    for corner_x, corner_y in [(x_min, y_min), (x_min, y_max),
+                                (x_max, y_min), (x_max, y_max)]:
+        bx  = ((corner_x - lx) / bin_w - 0.5).clamp(0.0, nbx - 1.001)
+        by_ = ((corner_y - ly) / bin_h - 0.5).clamp(0.0, nby - 1.001)
+        bx0 = bx.long().clamp(0, nbx - 1)
+        by0 = by_.long().clamp(0, nby - 1)
+        bx1 = (bx0 + 1).clamp(0, nbx - 1)
+        by1 = (by0 + 1).clamp(0, nby - 1)
+        fx  = (bx  - bx0.to(dtype=dtype)).clamp(0.0, 1.0)
+        fy  = (by_ - by0.to(dtype=dtype)).clamp(0.0, 1.0)
+        i00 = (bx0 * nby + by0).clamp(0, nbx * nby - 1)
+        i01 = (bx0 * nby + by1).clamp(0, nbx * nby - 1)
+        i10 = (bx1 * nby + by0).clamp(0, nbx * nby - 1)
+        i11 = (bx1 * nby + by1).clamp(0, nbx * nby - 1)
+        density_flat.scatter_add_(0, i00, corner_w * (1.0 - fx) * (1.0 - fy))
+        density_flat.scatter_add_(0, i01, corner_w * (1.0 - fx) * fy)
+        density_flat.scatter_add_(0, i10, corner_w * fx * (1.0 - fy))
+        density_flat.scatter_add_(0, i11, corner_w * fx * fy)
 
     return density_flat.view(nbx, nby), bin_w, bin_h, lx, ly
 
