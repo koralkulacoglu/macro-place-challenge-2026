@@ -563,7 +563,7 @@ class KoralPlacer:
             seed_t0      = time.time()
             full_results = []  # list of (oracle_cost, seed, pos)
 
-            for seed_idx in range(200):   # budget governs actual count
+            for seed_idx in range(400):   # budget governs actual count
                 elapsed_seeds = time.time() - seed_t0
                 if elapsed_seeds >= MAX_SEED_SECONDS:
                     break
