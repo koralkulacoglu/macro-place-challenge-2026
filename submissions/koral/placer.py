@@ -1682,9 +1682,27 @@ class KoralPlacer:
         # as the hSA acceptance criterion instead of delta_hpwl. This includes
         # RUDY congestion (~50-70% of proxy) rather than WL-only guidance.
         _fast_hsa_cur = None
+        _T_fhsa_start = 0.0; _T_fhsa_end = 0.0
         if _fast_ok and _fast is not None and _wl_frac < 0.07:
             _fast_hsa_cur = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
-            print(f"  [fast_eval] hSA mode: fast.evaluate() (wl_frac={_wl_frac:.1%})")
+            # Calibrate temperature in fast-eval space from delta distribution (same method as hpwl_T).
+            _fhsa_deltas = []
+            for _ in range(min(200, n_mv * 15)):
+                _i = random.choice(movable_hard)
+                _cx2 = float(np.clip(pos[_i, 0] + random.gauss(0, max(cw, ch) * 0.08), hw[_i], cw - hw[_i]))
+                _cy2 = float(np.clip(pos[_i, 1] + random.gauss(0, max(cw, ch) * 0.08), hh[_i], ch - hh[_i]))
+                if not _overlaps(_i, _cx2, _cy2):
+                    _saved = pos[_i].copy(); pos[_i, 0] = _cx2; pos[_i, 1] = _cy2
+                    _fd = abs(_fast.evaluate(torch.tensor(pos, dtype=torch.float32)) - _fast_hsa_cur)
+                    pos[_i] = _saved
+                    if _fd > 0: _fhsa_deltas.append(_fd)
+            if len(_fhsa_deltas) >= 10:
+                _T_fhsa_start = float(np.percentile(_fhsa_deltas, 60)) * 2.0
+                _T_fhsa_end   = float(np.percentile(_fhsa_deltas,  5)) * 0.05
+            else:
+                _T_fhsa_start = _fast_hsa_cur * 0.005
+                _T_fhsa_end   = _fast_hsa_cur * 0.00005
+            print(f"  [fast_eval] hSA mode: fast.evaluate() T={_T_fhsa_start:.5f}→{_T_fhsa_end:.6f} (wl_frac={_wl_frac:.1%})")
 
         _budget_log("hSA start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
@@ -1756,11 +1774,23 @@ class KoralPlacer:
                 if r < 0.15:
                     # Rotation move: try next orientation (no translation)
                     new_o = (int(ori[ci]) + 1) % 4
-                    delta_h = _delta_hpwl(ci, pos[ci, 0], pos[ci, 1], new_o)
-                    if delta_h < 0 or (T_hsa > 0 and random.random() < math.exp(
-                            -max(delta_h, 0.0) / T_hsa)):
+                    if _fast_hsa_cur is not None:
+                        _old_o2 = int(ori[ci])
                         _accept_move(ci, pos[ci, 0], pos[ci, 1], new_o)
-                        hsa_accepted += 1; accepted_since_ckpt += 1
+                        _fc2 = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
+                        _T_r = (_T_fhsa_start * math.exp(math.log(max(_T_fhsa_end, _T_fhsa_start * 1e-6) / _T_fhsa_start) * frac)
+                                if _T_fhsa_start > 0 else 0.0)
+                        _df2 = _fc2 - _fast_hsa_cur
+                        if _df2 < 0 or (_T_r > 0 and random.random() < math.exp(-_df2 / _T_r)):
+                            _fast_hsa_cur = _fc2; hsa_accepted += 1; accepted_since_ckpt += 1
+                        else:
+                            _accept_move(ci, pos[ci, 0], pos[ci, 1], _old_o2)
+                    else:
+                        delta_h = _delta_hpwl(ci, pos[ci, 0], pos[ci, 1], new_o)
+                        if delta_h < 0 or (T_hsa > 0 and random.random() < math.exp(
+                                -max(delta_h, 0.0) / T_hsa)):
+                            _accept_move(ci, pos[ci, 0], pos[ci, 1], new_o)
+                            hsa_accepted += 1; accepted_since_ckpt += 1
 
                 elif r < 0.35 and _hsa_swap_enabled and n_mv >= 2:
                     # Swap move: useful for dense benchmarks where Gaussian has <3% valid rate
@@ -1788,11 +1818,14 @@ class KoralPlacer:
                         continue
                     _hsa_gauss_valid += 1
                     if _fast_hsa_cur is not None:
-                        # Congestion-dominated: greedy accept by full proxy estimate.
+                        # Congestion-dominated: Boltzmann acceptance in fast-eval space.
                         _old_cx, _old_cy, _old_o = float(pos[ci, 0]), float(pos[ci, 1]), int(ori[ci])
                         _accept_move(ci, cx, cy, int(ori[ci]))
                         _fc = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
-                        if _fc < _fast_hsa_cur:
+                        _delta_f = _fc - _fast_hsa_cur
+                        _T_fhsa = (_T_fhsa_start * math.exp(math.log(max(_T_fhsa_end, _T_fhsa_start * 1e-6) / _T_fhsa_start) * frac)
+                                   if _T_fhsa_start > 0 else 0.0)
+                        if _delta_f < 0 or (_T_fhsa > 0 and random.random() < math.exp(-_delta_f / _T_fhsa)):
                             _fast_hsa_cur = _fc
                             hsa_accepted += 1; accepted_since_ckpt += 1
                         else:
@@ -1809,8 +1842,9 @@ class KoralPlacer:
                         torch.tensor(pos, dtype=torch.float32), benchmark, plc
                     )["proxy_cost"]
                     oracle_calls += 1; hsa_oracle += 1
-                    # Tighter revert for congestion-dominated: HPWL misleads SA far from oracle-optimal.
-                    _revert_thr = 1.03 if _wl_frac < 0.05 else 1.10
+                    # Tighter revert for fast.evaluate() mode: temperature allows wider exploration,
+                    # but oracle revert keeps state from drifting too far from best_pos.
+                    _revert_thr = 1.03 if _wl_frac < 0.05 else (1.05 if _fast_hsa_cur is not None else 1.10)
                     if cost < best_cost:
                         best_cost = cost; best_pos = pos.copy(); best_ori = ori.copy()
                         hsa_improved += 1; _reheat_no_improve = 0
