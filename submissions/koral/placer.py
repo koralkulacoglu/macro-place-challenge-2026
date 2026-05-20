@@ -199,7 +199,7 @@ class KoralPlacer:
         gamma: float = 4.0,
         sa_time_budget: int = int(os.environ.get("KORAL_SA_BUDGET", "3480")),
         seed: int = 42,
-        rudy_weight: float = float(os.environ.get("KORAL_RUDY_WEIGHT", "0.5")),
+        rudy_weight: float = float(os.environ.get("KORAL_RUDY_WEIGHT", "0.1")),
     ):
         self.target_density  = target_density
         self.density_weight  = density_weight
