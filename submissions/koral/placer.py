@@ -208,6 +208,21 @@ class KoralPlacer:
         self.seed            = seed
         self.rudy_weight     = rudy_weight
 
+        # Apply Xplace RUDY patches at startup when enabled (idempotent).
+        # Also copies the latest rudy_loss.py in case the image has a stale version.
+        if rudy_weight > 0:
+            _patch = Path(__file__).parent / "xplace_patches" / "apply_patches.py"
+            _rudy  = Path(__file__).parent / "xplace_patches" / "rudy_loss.py"
+            _xhome = Path(os.environ.get("XPLACE_HOME", "/opt/xplace"))
+            if _patch.exists() and _xhome.exists():
+                import subprocess as _sp, shutil as _sh
+                _r = _sp.run(["python3", str(_patch)], capture_output=True, text=True, cwd=str(_xhome))
+                for _l in (_r.stdout + _r.stderr).splitlines():
+                    if _l.strip(): print(f"  [xplace-patch] {_l}")
+                if _rudy.exists():
+                    _sh.copy2(str(_rudy), str(_xhome / "src" / "core" / "rudy_loss.py"))
+                    print("  [xplace-patch] rudy_loss.py updated")
+
         # Pre-fork SA worker pool BEFORE any CUDA usage.
         # Fork here while CUDA is clean; workers loop accepting tasks from successive benchmarks.
         self._n_pool = 16 if sys.platform != 'win32' else 0
@@ -449,8 +464,8 @@ class KoralPlacer:
             "--seed",                  str(seed),
             "--deterministic",         "True",
             "--use_route_force",       "True" if use_route_force else "False",
-            "--rudy_weight",           str(self.rudy_weight),
-            "--rudy_start_iter",       "1000",
+            *(["--rudy_weight", str(self.rudy_weight), "--rudy_start_iter", "1000"]
+              if self.rudy_weight > 0 else []),
             "--result_dir",            result_dir,
             "--exp_id",                exp_id,
             "--output_dir",            output_dir,
@@ -467,6 +482,11 @@ class KoralPlacer:
                 env={**os.environ, "PYTHONPATH": f"{xplace_home}:{os.environ.get('PYTHONPATH', '')}"}
             )
             elapsed = time.time() - t0
+            # Forward any RUDY/diagnostic stderr lines from Xplace subprocess
+            if proc.stderr:
+                for _line in proc.stderr.splitlines():
+                    if _line.strip():
+                        print(f"  [xpl-err] {_line}")
             if proc.returncode != 0:
                 tail = (proc.stdout or "")[-400:] + (proc.stderr or "")[-200:]
                 print(f"  [Xplace] seed={seed} failed rc={proc.returncode} in {elapsed:.0f}s: {tail[-100:]}")
