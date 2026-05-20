@@ -96,6 +96,20 @@ def _polish_worker_queued(q, args):
         q.put((args[1], float('inf')))
 
 
+def _pool_worker_loop(idx, task_q, result_q):
+    """Long-lived SA worker: loops accepting tasks from successive benchmarks."""
+    while True:
+        task = task_q.get()
+        if task is None:
+            break
+        bench_name, pos_np, sa_budget, seed = task
+        try:
+            result = _polish_worker((bench_name, pos_np, sa_budget, seed))
+            result_q.put(result)
+        except Exception as e:
+            result_q.put((pos_np, float('inf')))
+
+
 def _polish_worker(args):
     """Module-level worker for parallel SA (spawn context).
 
@@ -192,6 +206,27 @@ class KoralPlacer:
         self.sa_time_budget  = sa_time_budget
         self.seed            = seed
 
+        # Pre-fork SA worker pool BEFORE any CUDA usage.
+        # Fork here while CUDA is clean; workers loop accepting tasks from successive benchmarks.
+        self._n_pool = 16 if sys.platform != 'win32' else 0
+        self._pool_task_qs  = []
+        self._pool_result_q = None
+        self._pool_procs    = []
+
+        if self._n_pool > 0:
+            import multiprocessing as _mp
+            _ctx = _mp.get_context('fork')
+            self._pool_result_q = _ctx.Queue()
+            self._pool_task_qs  = [_ctx.Queue() for _ in range(self._n_pool)]
+            self._pool_procs    = [
+                _ctx.Process(target=_pool_worker_loop,
+                             args=(i, self._pool_task_qs[i], self._pool_result_q))
+                for i in range(self._n_pool)
+            ]
+            for _p in self._pool_procs:
+                _p.start()
+            print(f"  [KoralPlacer] {self._n_pool} SA workers pre-forked (CUDA-clean at init)")
+
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         torch.manual_seed(self.seed)
         random.seed(self.seed)
@@ -231,37 +266,7 @@ class KoralPlacer:
         n_mv_hard = sum(1 for i in range(benchmark.num_hard_macros)
                         if not benchmark.macro_fixed[i])
 
-        # PRE-FORK workers BEFORE Xplace uses the GPU.
-        # Fork copies the parent memory (copy-on-write) while CUDA is still clean.
-        # Workers sleep on their individual task queues until parent sends work.
-        import multiprocessing as _mp
-        _n_prefork = 16 if sys.platform != 'win32' else 0
-        _task_qs   = []
-        _result_q  = None
-        _procs     = []
-
-        if _n_prefork > 0:
-            _ctx = _mp.get_context('fork')
-            _result_q = _ctx.Queue()
-            _task_qs  = [_ctx.Queue() for _ in range(_n_prefork)]
-
-            def _prefork_worker_fn(idx):
-                task = _task_qs[idx].get()   # blocks until parent sends work
-                if task is None:
-                    return                    # poison pill
-                pos_np, sa_budget_w, seed_w = task
-                try:
-                    _result_q.put(_polish_worker(
-                        (benchmark.name, pos_np, sa_budget_w, seed_w)))
-                except Exception as _e:
-                    _result_q.put((pos_np, float('inf')))
-
-            _procs = [_ctx.Process(target=_prefork_worker_fn, args=(i,))
-                      for i in range(_n_prefork)]
-            for _p in _procs: _p.start()
-            budget.log("Workers pre-forked", "n=%d (CUDA clean at fork)" % _n_prefork)
-
-                # Try Xplace multi-seed GP (routability-aware, requires CUDA).
+        # Try Xplace multi-seed GP (routability-aware, requires CUDA).
         if self.sa_time_budget >= 300:
             ct_cost = compute_proxy_cost(ct_legal, benchmark, plc)["proxy_cost"] if plc else float('inf')
             best_ap_cost = ct_cost
@@ -305,16 +310,13 @@ class KoralPlacer:
             budget.log("SA start", f"sa_budget={sa_budget:.0f}s")
 
             _start_positions = [p.numpy() for p in xpl_tops] if xpl_tops else [placement.numpy()]
-            n_actual = min(len(_start_positions), _n_prefork) if _n_prefork > 0 else 0
+            n_actual = min(len(_start_positions), self._n_pool) if self._n_pool > 0 else 0
 
             if n_actual > 0:
-                print(f"  [parallel-SA] {n_actual} workers, pre-forked (CUDA-clean)")
+                print(f"  [parallel-SA] {n_actual} workers, pool (CUDA-clean at init)")
                 for i, pos_np in enumerate(_start_positions[:n_actual]):
-                    _task_qs[i].put((pos_np, sa_budget, self.seed + i))
-                for i in range(n_actual, _n_prefork):
-                    _task_qs[i].put(None)
-                results = [_result_q.get() for _ in range(n_actual)]
-                for _p in _procs: _p.join()
+                    self._pool_task_qs[i].put((benchmark.name, pos_np, sa_budget, self.seed + i))
+                results = [self._pool_result_q.get() for _ in range(n_actual)]
 
                 best_cost, best_np = float('inf'), None
                 for res_np, cost in results:
