@@ -267,41 +267,63 @@ class KoralPlacer:
                         if not benchmark.macro_fixed[i])
 
         # Try Xplace multi-seed GP (routability-aware, requires CUDA).
+        # KORAL_USE_CACHE=1 skips Xplace and loads saved tops for fast SA iteration.
+        _cache_dir  = os.path.join(os.path.dirname(__file__), "placements")
+        _xpl_cache  = os.path.join(_cache_dir, f"{benchmark.name}_xplace.pt")
+        _use_cache  = os.environ.get("KORAL_USE_CACHE", "0") == "1" and os.path.exists(_xpl_cache)
+
         if self.sa_time_budget >= 300:
             ct_cost = compute_proxy_cost(ct_legal, benchmark, plc)["proxy_cost"] if plc else float('inf')
             best_ap_cost = ct_cost
             best_placement = ct_legal
             budget.log("CT baseline", f"ct_cost={ct_cost:.4f}")
 
-            _fast_early = None
-            try:
-                from fast_eval import FastEvaluator as _FE
-                _fast_early = _FE(benchmark, plc)
-                _fe_r = _fast_early.calibrate(benchmark, plc, n_samples=5)
-                if _fe_r < 0.80:
-                    print(f"  [fast_eval] early calibration r={_fe_r:.4f} too low, disabling")
-                    _fast_early = None
-                else:
-                    print(f"  [fast_eval] early calibration r={_fe_r:.4f} (from CT positions)")
-            except Exception as e:
-                print(f"  [fast_eval] early calibration failed: {e}")
-
-            try:
-                xpl_tops = self._run_xplace_multiseed(benchmark, budget, _fast_early, plc)
-                if xpl_tops:
-                    xpl_cost = compute_proxy_cost(xpl_tops[0], benchmark, plc)["proxy_cost"]
-                    if xpl_cost < best_ap_cost:
-                        print(f"  [start] Xplace best={xpl_cost:.4f} < CT {best_ap_cost:.4f}"
-                              f"  top-{len(xpl_tops)} seeds for parallel SA")
-                        best_ap_cost = xpl_cost
-                        best_placement = xpl_tops[0]
+            if _use_cache:
+                _c = torch.load(_xpl_cache)
+                xpl_tops = [torch.from_numpy(p) if isinstance(p, np.ndarray) else p for p in _c["xpl_tops"]]
+                best_ap_cost = _c["best_cost"]
+                best_placement = xpl_tops[0]
+                print(f"  [cache] Loaded Xplace tops from {_xpl_cache} (best={best_ap_cost:.4f})")
+                budget.log("Xplace skipped (cache)", f"best_gp={best_ap_cost:.4f}")
+            else:
+                _fast_early = None
+                try:
+                    from fast_eval import FastEvaluator as _FE
+                    _fast_early = _FE(benchmark, plc)
+                    _fe_r = _fast_early.calibrate(benchmark, plc, n_samples=5)
+                    if _fe_r < 0.80:
+                        print(f"  [fast_eval] early calibration r={_fe_r:.4f} too low, disabling")
+                        _fast_early = None
                     else:
-                        print(f"  [start] Xplace best={xpl_cost:.4f} >= CT {best_ap_cost:.4f}, using CT")
-                        xpl_tops = None
-            except Exception as e:
-                import traceback
-                print(f"  [start] Xplace multi-seed failed: {e}\n{traceback.format_exc()[-300:]}")
-            budget.log("Xplace done", f"best_gp={best_ap_cost:.4f}")
+                        print(f"  [fast_eval] early calibration r={_fe_r:.4f} (from CT positions)")
+                except Exception as e:
+                    print(f"  [fast_eval] early calibration failed: {e}")
+
+                try:
+                    xpl_tops = self._run_xplace_multiseed(benchmark, budget, _fast_early, plc)
+                    if xpl_tops:
+                        xpl_cost = compute_proxy_cost(xpl_tops[0], benchmark, plc)["proxy_cost"]
+                        if xpl_cost < best_ap_cost:
+                            print(f"  [start] Xplace best={xpl_cost:.4f} < CT {best_ap_cost:.4f}"
+                                  f"  top-{len(xpl_tops)} seeds for parallel SA")
+                            best_ap_cost = xpl_cost
+                            best_placement = xpl_tops[0]
+                        else:
+                            print(f"  [start] Xplace best={xpl_cost:.4f} >= CT {best_ap_cost:.4f}, using CT")
+                            xpl_tops = None
+                except Exception as e:
+                    import traceback
+                    print(f"  [start] Xplace multi-seed failed: {e}\n{traceback.format_exc()[-300:]}")
+                budget.log("Xplace done", f"best_gp={best_ap_cost:.4f}")
+
+                # Save Xplace tops for fast SA-only re-runs (KORAL_USE_CACHE=1).
+                if xpl_tops:
+                    try:
+                        os.makedirs(_cache_dir, exist_ok=True)
+                        torch.save({"xpl_tops": [t.numpy() for t in xpl_tops], "best_cost": best_ap_cost}, _xpl_cache)
+                        print(f"  [cache] Saved Xplace tops → {_xpl_cache}")
+                    except Exception as _ce:
+                        print(f"  [cache] Save failed: {_ce}")
 
             placement = best_placement
 
