@@ -557,7 +557,7 @@ class KoralPlacer:
                 _noise_sched = [0.02, 0.03, 0.05, 0.07, 0.10, 0.13]
             else:
                 _noise_sched = [0.05, 0.10, 0.13, 0.15, 0.18, 0.20]
-            MAX_SEED_SECONDS = 1400 if _nets_per_macro > 60 else 1100
+            MAX_SEED_SECONDS = 1800
             MIN_SA_SECONDS   = 400
             budget.log("Xplace seeds start", f"max={MAX_SEED_SECONDS}s  inner_iter=8000")
             seed_t0      = time.time()
