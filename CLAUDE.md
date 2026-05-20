@@ -120,60 +120,67 @@ If you have non-standard deps, include a `Dockerfile` in your submission. Otherw
 
 ## Our Submission: `submissions/koral/`
 
-CT positions → Xplace multi-seed GP → sequential SA. DREAMPlace has been removed.
+CT positions → Xplace multi-seed GP (with RUDY v3 congestion gradient) → parallel SA.
 
-**Pipeline (git head: f7acf29):**
+**Pipeline (git head: f800731):**
 1. CT positions (from initial.plc)
-2. Xplace multi-seed GP (6 seeds × ~6s = ~36s, bookshelf format)
+2. Xplace multi-seed GP (up to 1800s / 400 seeds, bookshelf format)
    - `stop_overflow=0.05`, `inner_iter=8000`, `mixed_size=True`
-   - Noise schedule: [0.005, 0.025, 0.05, 0.10, 0.15, 0.20]
-   - Best seed selected by oracle cost after legalization
+   - Noise schedule: [0.05, 0.10, 0.13, 0.15, 0.18, 0.20] (adaptive: lower for hyperconnected benchmarks)
+   - **RUDY v3 congestion gradient** (corner scatter, `rudy_weight=0.1`, fires at overflow<0.08)
+   - Xplace patches applied at init via `xplace_patches/apply_patches.py` (idempotent)
+   - Best seed selected by oracle cost after legalization; top-16 kept for SA
 3. `_legalize_hard` (greedy micro-legalization)
-4. Sequential SA (3480s): CD → LNS → FD → hSA → oSA
-   - n_workers=1 (parallel SA deadlocks due to CUDA+fork)
+4. Parallel SA (~1800s): CD → LNS → FD → hSA (Boltzmann) → oSA
+   - 16 workers pre-forked in `__init__` before CUDA (fixes CUDA+fork deadlock)
    - FastEvaluator: 383x speedup for SA decisions
+   - hSA uses Boltzmann acceptance in fast-eval space for congestion-dominated benchmarks
 
-**Verified scores (measured 2026-05-19 in Docker):**
-- ibm01: 0.908 after Xplace GP+legalization (before SA); ~0.89 after full SA
-- Xplace GP avg across 17 benchmarks: ~1.25
-- After SA avg: ~1.10–1.20 (estimated)
+**Verified scores (measured 2026-05-20 in Docker, bench_final_v2):**
+- ibm01: **0.8850** (274 seeds × 6s, best GP oracle 0.8855, SA 1800s) ✅
+- ibm02: **1.5307** (Xplace lost to double-patching bug — SA only from CT 1.5658) ⚠️
+- ibm03: in progress, best GP oracle 1.1521 (CT=1.3255, 13% improvement)
+- ibm04–17: pending
 
 **Key empirical facts:**
 - `stop_overflow=0.01` crashes Xplace's LP macro legalization (PulpError: NaN/inf). Use 0.05.
-- `use_route_force=True` crashes Xplace's GPU pattern router for IBM benchmarks (1.8M route segments overflow kernel buffer). Do not attempt.
-- Parallel SA deadlocks when CUDA is active (CUDA+fork futex issue) → n_workers=1 always.
-- Xplace GP optimizes WL+Density only. Congestion (~40% of proxy cost) is NOT reduced during GP. This is the main gap vs rank 1.
-- ibm02 and ibm18 barely improve with Xplace (−0.9% and −1.5%) — root cause unknown.
+- `use_route_force=True` crashes Xplace's GPU pattern router for IBM benchmarks (1.8M route segments overflow kernel buffer). Do NOT attempt.
+- CUDA+fork deadlock: fixed by pre-forking 16 SA workers in `__init__` before any CUDA usage.
+- RUDY v1 failed (acted as WL gradient). RUDY v2 fixed gradient direction (detach demand map, gradient through node positions). RUDY v3 uses 4 bbox corners instead of net center for more accurate congestion map.
+- Double-patching bug: KoralPlacer re-initializes per benchmark in worker processes, applying Xplace patches 16× and corrupting main.py. Fixed: `apply_patches.py` checks if `new` content already present; `KoralPlacer._xplace_patched` class guard prevents re-run within a process.
+- Budget split: 1800s Xplace (MAX_SEED_SECONDS) + remainder for SA. For fast benchmarks (6s/seed) SA gets ~1800s; for slow ones it gets more.
+- KORAL_RUDY_WEIGHT env var controls rudy_weight (default 0.1).
 
 **Key files:**
-- `submissions/koral/placer.py` — `KoralPlacer` class (~1300 lines)
+- `submissions/koral/placer.py` — `KoralPlacer` class (~1800 lines)
 - `submissions/koral/bookshelf.py` — Benchmark → ISPD2005 bookshelf for Xplace
 - `submissions/koral/fast_eval.py` — FastEvaluator (383x SA speedup)
 - `submissions/koral/Dockerfile` — Docker: Xplace + dependencies
+- `submissions/koral/xplace_patches/rudy_loss.py` — RUDY v3 congestion loss
+- `submissions/koral/xplace_patches/apply_patches.py` — patches Xplace source at runtime
 - `HANDOFF.md` — detailed state, investigation results, next steps
 
-**Dev loop (Docker — new files need `docker cp`, bind mount doesn't see them):**
+**Dev loop (Docker):**
 ```bash
-# Build image (Xplace, ~40 min first time)
+# Build image (~40 min first time; only needed after Dockerfile changes)
 docker build -t koral-placer-xplace -f submissions/koral/Dockerfile .
 
-# Start container for testing
-docker run -d --runtime=nvidia --gpus all \
-  -v "C:/path/to/repo:/challenge" --network none \
-  --name test_xplace --entrypoint=bash koral-placer-xplace -c "sleep 3600"
-
-# Copy updated files (required — bind mount only shows build-time copies)
-docker cp submissions/koral/placer.py test_xplace:/challenge/submissions/koral/placer.py
-
-# Run test
-docker exec test_xplace bash -c \
-  "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py -b ibm01"
-
-# Full submission run
+# Full submission run (bind mount provides placer.py, rudy_loss.py, apply_patches.py live)
 docker run --rm --runtime=nvidia --gpus all \
   -v "C:/path/to/repo:/challenge" --network none \
-  koral-placer-xplace submissions/koral/placer.py --all
+  -e KORAL_RUDY_WEIGHT=0.1 \
+  --entrypoint bash koral-placer-xplace \
+  -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py --all"
+
+# Single benchmark test
+docker run --rm --runtime=nvidia --gpus all \
+  -v "C:/path/to/repo:/challenge" --network none \
+  -e KORAL_RUDY_WEIGHT=0.1 \
+  --entrypoint bash koral-placer-xplace \
+  -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py -b ibm01"
 ```
+
+Note: `placer.py`, `rudy_loss.py`, and `apply_patches.py` are bind-mounted and visible live — no `docker cp` needed for these. The patches are applied at KoralPlacer init via `apply_patches.py` (idempotent), and `rudy_loss.py` is copied from the bind mount to `/opt/xplace/src/core/` at that time.
 
 ## Reproducibility Warning
 
