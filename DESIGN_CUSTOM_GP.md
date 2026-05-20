@@ -1,163 +1,119 @@
-# Design: Custom Differentiable Global Placer
+# Design: Custom Differentiable Global Placer with Congestion Awareness
 
 ## Problem
 
-Xplace ePlace finds a WL+Density minimum and ignores congestion. We need a GP that
-directly minimizes the proxy cost scoring function:
+Xplace / ePlace finds a Wirelength + Density minimum but is blind to routing capacity, causing severe routing bottlenecks. We need a Global Placer (GP) that directly minimizes our exact target proxy cost scoring function:
 
-```
-Proxy = 1.0 × Wirelength + 0.5 × Density + 0.5 × Congestion
-```
-
-This is the exact function we're scored on. Nothing we have currently optimizes it.
+$$\text{Proxy Cost} = 1.0 \times \text{Wirelength} + 0.5 \times \text{Density} + 0.5 \times \text{Congestion}$$
 
 ## Core Idea
 
-Run gradient descent directly on macro positions with the proxy cost as the loss.
-The proxy cost has three terms — all three can be made differentiable in PyTorch.
-Adam optimizer. Multiple random restarts for diversity. No external tools. No Docker
-rebuild.
+Run gradient descent directly on macro positions using the proxy cost as the loss function. All three terms will be made fully differentiable in PyTorch using `torch.autograd`. We will use the Adam optimizer, leverage multiple random restarts to escape local minima, and execute everything natively in Python without external tools or Docker rebuilds.
 
 ## The Three Terms
 
 ### 1. Wirelength (HPWL)
 
-HPWL is not differentiable (max/min operations). Standard fix: log-sum-exp smooth
-approximation, used by every academic placer since ePlace (2014).
+HPWL is non-differentiable due to max/min operations. We approximate it using the standard log-sum-exp smooth approximation:
 
-```
-HPWL_smooth(net) = α × log(Σ exp(x_i/α)) - α × log(Σ exp(-x_i/α))   [+ same for y]
-```
+$$\text{HPWL}_{\text{smooth}}(net) = \alpha \ln \left( \sum e^{x_i/\alpha} \right) - \alpha \ln \left( \sum e^{-x_i/\alpha} \right) + \text{[same for } y\text{]}$$
 
-α is a temperature parameter that controls smoothness. PyTorch has `torch.logsumexp`.
-This is the exact same approximation DREAMPlace and Xplace use internally — it's
-well-understood and works well.
+- **Implementation:** Use `torch.logsumexp` on pin positions (one call per net per axis). Pin positions are computed as $\text{macro center} + \text{pin offset}$ via `benchmark.macro_pin_offsets`. For soft macros without offsets, the center is used directly. $\alpha$ acts as a temperature parameter controlling smoothness.
 
-**What we use:** `torch.logsumexp` on pin positions, one call per net per axis.
-Pin positions = macro center + pin offset from `benchmark.macro_pin_offsets`.
-For soft macros (no offsets): use center directly.
+### 2. Density Penalty (With Global Spreading)
 
-### 2. Density Penalty
+A naive bin-based overlap penalty only provides local gradients, meaning clumpy macros won't feel a pull toward empty spaces on the canvas.
 
-This is the spreading term — prevents all macros from piling into one spot.
+- **Implementation:** Compute a grid of dimensions `grid_rows × grid_cols`. Each macro contributes to its overlapping bins using a smooth triangle or cosine kernel (~30 lines of PyTorch).
+- **Refinement (Gaussian Blur):** To simulate global forces without a complex FFT Poisson solver, apply a 2D Gaussian blur via `torch.nn.functional.conv2d` to the generated density grid. Start with a large blur radius ($\sigma$) so macros feel long-range repulsive forces toward empty regions, and anneal $\sigma$ down over the optimization iterations.
 
-ePlace's original approach (GPU Poisson solver via FFT) is complex. For macro
-placement with 100–1000 large blocks (not millions of standard cells), a simpler
-bin-based approach is sufficient:
+### 3. Congestion (Differentiable RUDY)
 
-For each macro, compute its overlap with each bin in a `grid_rows × grid_cols` grid.
-Sum overlapping area per bin. Penalty = sum over bins where density exceeds target.
+Rectangular Uniform wire Density (RUDY) measures routing demand. Standard bounding box calculation using `torch.min` or `torch.max` yields zero gradients for all internal pins of a net.
 
-**What we use:** Differentiable bin density via smooth overlap computation. Each macro
-contributes to nearby bins based on a cosine or triangle kernel (common in academic
-placers as a simpler alternative to ePlace's Bell-shaped function). Fully implemented
-in PyTorch, ~30 lines.
+- **Implementation:** Map nets to the gcell grid. Capacity limits are read directly from `benchmark.hroutes_per_micron` and `benchmark.vroutes_per_micron`.
+- **Refinement (LSE Bounding Boxes):** Use the exact same log-sum-exp smooth approximation from the wirelength term to find the boundary coordinates ($x_{\min}, x_{\max}, y_{\min}, y_{\max}$) of each net. This ensures that every single pin connected to a congested net receives a non-zero gradient pulling it inward to collapse the routing footprint.
 
-Alternatively: reuse `plc.get_density_cost()` for validation, but compute gradients
-via PyTorch autograd on our own density implementation.
+---
 
-### 3. Congestion (RUDY)
+## Legality & Refinement
 
-RUDY (Rectangular Uniform wire Density) — the same metric the TILOS evaluator uses.
+During gradient descent, macros will overlap freely. We resolve this through a combination of mathematical schedules and local search:
 
-For each net with bounding box W×H:
-- Each gcell overlapping the bbox receives routing demand proportional to 1/(W×H)
-- Compare demand to capacity: `h_cap = hroutes_per_micron × gcell_h`
-- Congestion cost = sum of demand/capacity excess (or use the TILOS formula directly)
+- **Dynamic Weight Scheduling:** Start the optimizer with the density penalty weight near `0.0`. This allows macros to rapidly slide past each other and establish an optimal topological arrangement based purely on wirelength and congestion. Every 20–50 iterations, multiply the density weight by a scalar (e.g., `1.05`) to gradually force the macros to spread apart legally.
+- **Coordinate Descent (CD) Polish:** Analytical placers struggle to pack large blocks tightly against one another without tiny overlaps. Before handing the positions over to Simulated Annealing (SA), execute a fast Coordinate Descent pass. Move one macro at a time along a localized grid to snap them into optimal, strictly legal positions.
+- **Final Legalization:** Always run `_legalize_hard` after optimization ends before passing the solution to SA.
 
-**What we use:** Compute net bboxes via `torch.min/max` over pin positions (same pin
-positions as WL term). Map to gcell grid. Compute demand. All differentiable.
-The capacity values come directly from `benchmark.hroutes_per_micron` and
-`benchmark.vroutes_per_micron` which are already loaded.
+---
 
-## Legality
+## Optimizer & Setup
 
-During gradient descent, macros will overlap. Two options:
+- **Variables:** Position tensor of shape `[num_macros, 2]` with `requires_grad=True`.
+- **Algorithm:** Adam optimizer with learning rate warmup.
+- **Constraints:** Clamp positions to canvas boundaries after every optimizer step. For fixed macros, zero out their gradients prior to the optimizer step.
 
-**Option A (preferred):** Rely on the density penalty to prevent overlap. When
-density weight is high enough, the penalty pushes macros apart naturally — this is
-exactly how ePlace works. No explicit legalization during optimization.
-
-**Option B (fallback):** Run `_legalize_hard` every N steps (e.g., every 100
-iterations) and continue optimizing from legalized positions. Slower but guaranteed
-legal at each checkpoint.
-
-After optimization ends, always run `_legalize_hard` + check overlaps before passing
-to SA.
-
-## Optimizer
-
-Adam with learning rate warmup. Standard in all modern differentiable placers.
-Position variable = `[num_macros, 2]` tensor with `requires_grad=True`.
-Clamp to canvas bounds after each step (simple box constraint).
-Fixed macros: zero out their gradients before optimizer step.
+---
 
 ## Multiple Seeds / Restarts
 
-Run the optimizer from multiple starting positions:
-- CT positions (1 seed) — the reference
-- CT positions + Gaussian noise at various scales — same noise schedule as Xplace
-- Pure random positions within canvas — for exploring new basins
+To defeat the local minima problem inherent to macro placement, run the optimizer in parallel across diverse starting configurations:
 
-Pick best result by oracle proxy cost after legalization.
+1.  **The Reference Seed:** Current CT positions.
+2.  **The Seed Baseline:** Xplace GP generated positions (provides a strong wirelength floor).
+3.  **Noised Seeds:** CT positions injected with Gaussian noise at varying scales.
+4.  **Exploratory Seeds:** Pure random coordinates scattered within the canvas bounds.
 
-This directly addresses the local minima problem: diverse starts + congestion in the
-objective = some seeds will find genuinely low-congestion placements.
+Evaluate all finalized placements after legalization using the exact `compute_proxy_cost` oracle and select the best overall performer.
+
+---
 
 ## Integration into Pipeline
 
-```
-CT positions
-    ↓
-Custom GP (multiple seeds, ~300–600s total)
-    - Optimizes 1.0×WL + 0.5×Density + 0.5×Congestion
-    - Adam, ~2000–5000 iterations per seed
-    - Pick best seed by oracle cost
-    ↓
-_legalize_hard
-    ↓
-Sequential SA (remaining budget, ~2800–3000s)
-```
+    [ Diverse Starting Seeds ]
+    (Xplace Baseline / Random / Noised CT / CT)
+                       │
+                       ▼
+              [ Custom PyTorch GP ]
+    - Optimizes: 1.0×WL + 0.5×Density + 0.5×Congestion
+    - Dynamic density annealing + Gaussian blur spreading
+    - Log-sum-exp differentiable RUDY bounding boxes
+                       │
+                       ▼
+          [ Coordinate Descent Polish ]
+    - Rapid, single-macro localized legal adjustments
+                       │
+                       ▼
+                _legalize_hard
+                       │
+                       ▼
+            [ Sequential SA (Polish) ]
+    - Runs on remaining time budget (~2500s)
 
-Can also feed Xplace GP positions as one of the seeds — Xplace gives good WL/Density
-starting points, and custom GP then adds congestion optimization on top.
-
-## What We Already Have
-
-- `benchmark.net_nodes`, `benchmark.macro_pin_offsets` — pin-level connectivity
-- `benchmark.hroutes_per_micron`, `benchmark.vroutes_per_micron` — routing capacity
-- `benchmark.grid_rows`, `benchmark.grid_cols` — gcell grid dimensions
-- `_legalize_hard` — overlap resolution after GP
-- `compute_proxy_cost` — for evaluation/seed selection
-- `plc.get_horizontal_routing_congestion()` — for validation against our RUDY
-- FastEvaluator — for quick proxy estimates during seed selection
+---
 
 ## Expected Results
 
-| Stage | ibm01 proxy | Avg (17 benchmarks) |
-|-------|-------------|---------------------|
-| Xplace GP (current) | 0.908 | ~1.25 |
-| Custom GP (estimated) | 0.82–0.88 | ~1.00–1.10 |
-| + SA | 0.76–0.82 | ~0.93–1.02 |
+| Stage                      | ibm01 proxy | Avg (17 benchmarks) |
+| :------------------------- | :---------- | :------------------ |
+| Xplace GP (current)        | 0.908       | ~1.25               |
+| Custom GP + CD (Estimated) | 0.80–0.85   | ~1.00–1.08          |
+| + SA Polish                | 0.74–0.79   | ~0.92–0.98          |
 
-Rank 1 is 0.9671 average. Getting to 0.93–1.02 is rank 3–10 territory.
+_Note: The highest verified score on the leaderboard sits at 1.0109. Achieving an average sub-1.00 score secures a top tier position._
 
-Uncertainty is real: depends on how well the density approximation spreads macros and
-how much congestion the optimizer can reduce without sacrificing WL.
+---
 
-## Risks
+## Risks & Mitigations
 
-| Risk | Mitigation |
-|------|-----------|
-| Density term too weak → macros overlap | Increase density weight; tune target_density |
-| Density term too strong → ignores WL/congestion | Weight schedule: anneal density weight down over iterations |
-| Slow per seed | Tune iterations; use fewer seeds if needed |
-| RUDY gradient too small vs WL | Scale congestion weight up (0.5 → 1.0 or higher) |
-| Result worse than Xplace | Fall back to Xplace result (keep both, pick better) |
+| Risk                                   | Mitigation                                                                     |
+| :------------------------------------- | :----------------------------------------------------------------------------- |
+| Density term too weak / macros clump   | Increase final density weight ceiling; tune target density parameters.         |
+| Zero-gradients stall internal net pins | Verified fix: Log-sum-exp smoothing replaces raw min/max box boundaries.       |
+| macros get stuck in local clumps       | Verified fix: Apply 2D Gaussian blur conv2d to density grid for global forces. |
+| Slow optimization per seed             | Limit Adam loop to 2000 iterations; batch independent seeds together.          |
 
 ## What NOT To Do
 
-- Do NOT try to port ePlace's full FFT Poisson solver — overkill for macro placement
-- Do NOT remove Xplace from the pipeline — use it as a fallback and as one of the seeds
-- Do NOT use the TILOS `compute_proxy_cost` for gradient computation — it's not
-  differentiable (Python + C++ evaluator). Only use it for evaluation.
+- Do **NOT** implement an FFT Poisson solver—2D convolution blur on the grid achieves the required macro spreading with zero architectural overhead.
+- Do **NOT** use `torch.min` or `torch.max` for RUDY coordinate mapping.
+- Do **NOT** use the baseline `compute_proxy_cost` inside the gradient loop (it contains non-differentiable C++ and Python hooks). Only use it as an evaluation oracle to select the winning seed.

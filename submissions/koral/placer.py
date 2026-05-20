@@ -297,6 +297,7 @@ class KoralPlacer:
                 import traceback
                 print(f"  [start] Xplace multi-seed failed: {e}\n{traceback.format_exc()[-300:]}")
             budget.log("Xplace done", f"best_gp={best_ap_cost:.4f}")
+
             placement = best_placement
 
         if plc is not None and self.sa_time_budget > 0:
@@ -327,6 +328,17 @@ class KoralPlacer:
                 placement = self._cd_lns_polish(placement, benchmark, plc, budget=budget)
 
         budget.log("done", f"benchmark={benchmark.name}")
+
+        # Save final placement so results can be inspected / reused later.
+        try:
+            _save_dir = os.path.join(os.path.dirname(__file__), "placements")
+            os.makedirs(_save_dir, exist_ok=True)
+            _save_path = os.path.join(_save_dir, f"{benchmark.name}_final.pt")
+            torch.save({"positions": placement, "benchmark_name": benchmark.name}, _save_path)
+            print(f"  [save] placement → {_save_path}")
+        except Exception as _e:
+            print(f"  [save] skipped: {_e}")
+
         return placement
 
     @staticmethod
@@ -533,16 +545,23 @@ class KoralPlacer:
             # entire phase budget with zero usable seeds.
             # 8000 iterations: enough for dense benchmarks to converge; stop_overflow=0.05
             # terminates early for small/easy benchmarks so extra iters cost nothing.
-            # noise_ratio schedule: coarse → scattered, cycling through on repeat
-            # Gives genuine macro arrangement diversity beyond just RNG seed variation.
-            _noise_sched = [0.005, 0.025, 0.05, 0.10, 0.15, 0.20]
-            MAX_SEED_SECONDS = 700
+            # Adaptive noise schedule based on netlist connectivity.
+            # Hyperconnected benchmarks (ibm18-like: ~92 nets/macro) benefit from
+            # low noise because CT clustering is already good — high noise destroys it.
+            # Normal benchmarks (ibm01: 24 nets/macro) need higher noise to escape the
+            # CT local minimum. Threshold 60 has clear margin from all known IBM cases.
+            _nets_per_macro = benchmark.num_nets / max(benchmark.num_hard_macros, 1)
+            if _nets_per_macro > 60:
+                _noise_sched = [0.02, 0.03, 0.05, 0.07, 0.10, 0.13]
+            else:
+                _noise_sched = [0.05, 0.10, 0.13, 0.15, 0.18, 0.20]
+            MAX_SEED_SECONDS = 1400 if _nets_per_macro > 60 else 1100
             MIN_SA_SECONDS   = 400
             budget.log("Xplace seeds start", f"max={MAX_SEED_SECONDS}s  inner_iter=8000")
             seed_t0      = time.time()
             full_results = []  # list of (oracle_cost, seed, pos)
 
-            for seed_idx in range(100):   # budget governs actual count
+            for seed_idx in range(200):   # budget governs actual count
                 elapsed_seeds = time.time() - seed_t0
                 if elapsed_seeds >= MAX_SEED_SECONDS:
                     break
