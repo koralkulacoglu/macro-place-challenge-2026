@@ -1672,9 +1672,23 @@ class KoralPlacer:
                 print(f"  [FD] {fd_improved}/{fd_step} steps improved, best={best_cost:.4f}")
             _rebuild_state(best_pos, best_ori)
 
+        # Re-calibrate FastEvaluator: CD/LNS/FD have moved positions far from CT.
+        if _fast_ok and _fast is not None:
+            _fast_r2 = _fast.calibrate(benchmark, plc, n_samples=8)
+            _fast_ok = _fast_r2 > 0.90
+            print(f"  [fast_eval] pre-hSA recalibrate: r={_fast_r2:.4f}")
+
+        # For congestion-dominated benchmarks (wl_frac < 7%), use fast.evaluate()
+        # as the hSA acceptance criterion instead of delta_hpwl. This includes
+        # RUDY congestion (~50-70% of proxy) rather than WL-only guidance.
+        _fast_hsa_cur = None
+        if _fast_ok and _fast is not None and _wl_frac < 0.07:
+            _fast_hsa_cur = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
+            print(f"  [fast_eval] hSA mode: fast.evaluate() (wl_frac={_wl_frac:.1%})")
+
         _budget_log("hSA start", f"best={best_cost:.4f}  oracle_calls={oracle_calls}")
 
-        # â”€â”€ HPWL-guided SA with periodic oracle checkpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        #â”€â”€ HPWL-guided SA with periodic oracle checkpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Uses HPWL as fast surrogate (O(degree), ~0.01ms/call) for SA acceptance,
         # with proxy oracle checkpoint every HPWL_CKPT_N accepted moves (~0.5s/call).
         # Explores ~50Ã— more positions per oracle call budget vs pure oracle SA.
@@ -1773,11 +1787,22 @@ class KoralPlacer:
                             _hsa_swap_enabled = (_hsa_gauss_valid / _hsa_gauss_tried) < 0.03
                         continue
                     _hsa_gauss_valid += 1
-                    delta_h = _delta_hpwl(ci, cx, cy, int(ori[ci]))
-                    if delta_h < 0 or (T_hsa > 0 and random.random() < math.exp(
-                            -max(delta_h, 0.0) / T_hsa)):
+                    if _fast_hsa_cur is not None:
+                        # Congestion-dominated: greedy accept by full proxy estimate.
+                        _old_cx, _old_cy, _old_o = float(pos[ci, 0]), float(pos[ci, 1]), int(ori[ci])
                         _accept_move(ci, cx, cy, int(ori[ci]))
-                        hsa_accepted += 1; accepted_since_ckpt += 1
+                        _fc = _fast.evaluate(torch.tensor(pos, dtype=torch.float32))
+                        if _fc < _fast_hsa_cur:
+                            _fast_hsa_cur = _fc
+                            hsa_accepted += 1; accepted_since_ckpt += 1
+                        else:
+                            _accept_move(ci, _old_cx, _old_cy, _old_o)
+                    else:
+                        delta_h = _delta_hpwl(ci, cx, cy, int(ori[ci]))
+                        if delta_h < 0 or (T_hsa > 0 and random.random() < math.exp(
+                                -max(delta_h, 0.0) / T_hsa)):
+                            _accept_move(ci, cx, cy, int(ori[ci]))
+                            hsa_accepted += 1; accepted_since_ckpt += 1
 
                 if accepted_since_ckpt >= HPWL_CKPT_N:
                     cost = compute_proxy_cost(
