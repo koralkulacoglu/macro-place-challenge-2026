@@ -1200,7 +1200,7 @@ class LKPlacer:
     def __init__(
         self,
         seed: int = 42,
-        time_budget_s: float = 3000.0,
+        time_budget_s: float = 3300.0,  # 55 min hard cutoff (4 min margin under 1h limit)
         # Phase α₁ (electrostatic GP)
         run_gp: bool = True,
         gp_pop_size: int = 4,
