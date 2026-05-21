@@ -63,6 +63,7 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from macro_place.benchmark import Benchmark
 
@@ -677,7 +678,7 @@ def tilos_wl_normalized(
     return raw / ((cw + ch) * max(n_nets, 1))
 
 
-def tilos_rudy_normalized(
+def _tilos_rudy_h_v_demand(
     pop: torch.Tensor,
     owner_idx: torch.Tensor,
     pin_off: torch.Tensor,
@@ -693,24 +694,15 @@ def tilos_rudy_normalized(
     h_routes_per_um: float,
     v_routes_per_um: float,
     smooth_range: int = 2,
-    k_frac: float = 0.05,
-) -> torch.Tensor:
-    """
-    RUDY surrogate normalized as close to TILOS as a continuous approximation
-    allows.  Differs from the exact TILOS routing (which is discrete L/T
-    Steiner routing per net) but applies *the same per-axis normalisation*
-    and *the same 1-D smoothing kernel*.
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute the TILOS-faithful per-cell H/V routing demand maps.
 
-    Steps:
-      1. Compute per-net bbox via hard min/max scatter (subgradient via
-         torch.min/max).
-      2. H-demand per cell = (wl_x / bbox_area) × (cell ∩ bbox area).
-         V-demand similarly.
-      3. Normalise V by grid_v_routes = grid_w × v_routes_per_um and H by
-         grid_h_routes = grid_h × h_routes_per_um (same as TILOS).
-      4. Apply TILOS's 1-D smoothing: V along columns, H along rows, kernel
-         size = 2*smooth_range + 1.
-      5. Concatenate V+H lists and return top-5% mean (TILOS's abu).
+    Returns (h_dem, v_dem) both shaped [K, Gy, Gx], already normalised by
+    per-axis routing track capacity and 1-D box-smoothed at `smooth_range`.
+    These are the same intermediates the public `tilos_rudy_normalized` uses
+    before the top-k mean reduction; exposing them lets callers sample
+    congestion at arbitrary positions (e.g. anti-congestion gradient on
+    hard macros).
     """
     K = pop.shape[0]
     device = pop.device
@@ -735,7 +727,6 @@ def tilos_rudy_normalized(
     y_min.scatter_reduce_(1, idx, y, reduce="amin", include_self=True)
     bbox_w = (x_max - x_min).clamp(min=1e-3)
     bbox_h = (y_max - y_min).clamp(min=1e-3)
-    bbox_area = bbox_w * bbox_h
 
     grid_w = cw / grid_col
     grid_h = ch / grid_row
@@ -751,7 +742,6 @@ def tilos_rudy_normalized(
     row_bb = row_b.view(1, 1, grid_row); row_tb = row_t.view(1, 1, grid_row)
     x_ov = (torch.min(bxr, col_rb) - torch.max(bxl, col_lb)).clamp(min=0.0)  # [K, n_nets, Gx]
     y_ov = (torch.min(byt, row_tb) - torch.max(byb, row_bb)).clamp(min=0.0)  # [K, n_nets, Gy]
-    # H demand: per-cell contribution = (wl_x / area) × x_ov × y_ov  = x_ov × y_ov / bbox_h
     inv_h = (1.0 / bbox_h).unsqueeze(-1)
     inv_w = (1.0 / bbox_w).unsqueeze(-1)
     h_per_n_x = inv_h * x_ov  # [K, n_nets, Gx]
@@ -768,20 +758,41 @@ def tilos_rudy_normalized(
     # TILOS smoothing — 1-D box-filter along axis of routing, width 2*smooth_range+1
     if smooth_range > 0:
         ksz = 2 * smooth_range + 1
-        # V routing congestion smooths along columns (axis Gx); H smooths along rows (axis Gy).
-        # Use conv1d with appropriate reshaping.
         v_dem_r = v_dem.unsqueeze(1)  # [K, 1, Gy, Gx]
         h_dem_r = h_dem.unsqueeze(1)
-        # Build a 1-D smoothing kernel that sums (TILOS divides BEFORE distribution then sums after)
-        # TILOS effective effect: each cell averages with its kernel-window neighbours and
-        # the same value gets *added* into adjacent cells (see __smooth_routing_cong) — net
-        # effect is a box filter normalised by (kernel-size at that location).
-        # We approximate with a simple box filter of length ksz.
         kx = torch.ones(1, 1, 1, ksz, device=device, dtype=pop.dtype) / ksz
         ky = torch.ones(1, 1, ksz, 1, device=device, dtype=pop.dtype) / ksz
-        v_dem = torch.nn.functional.conv2d(v_dem_r, kx, padding=(0, smooth_range)).squeeze(1)
-        h_dem = torch.nn.functional.conv2d(h_dem_r, ky, padding=(smooth_range, 0)).squeeze(1)
+        v_dem = F.conv2d(v_dem_r, kx, padding=(0, smooth_range)).squeeze(1)
+        h_dem = F.conv2d(h_dem_r, ky, padding=(smooth_range, 0)).squeeze(1)
 
+    return h_dem, v_dem
+
+
+def tilos_rudy_normalized(
+    pop: torch.Tensor,
+    owner_idx: torch.Tensor,
+    pin_off: torch.Tensor,
+    net_id: torch.Tensor,
+    n_nets: int,
+    port_pos: torch.Tensor,
+    n_hard: int,
+    n_macros: int,
+    grid_col: int,
+    grid_row: int,
+    cw: float,
+    ch: float,
+    h_routes_per_um: float,
+    v_routes_per_um: float,
+    smooth_range: int = 2,
+    k_frac: float = 0.05,
+) -> torch.Tensor:
+    """RUDY surrogate normalized to TILOS conventions; returns [K] top-k% mean."""
+    K = pop.shape[0]
+    h_dem, v_dem = _tilos_rudy_h_v_demand(
+        pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+        n_hard, n_macros, grid_col, grid_row, cw, ch,
+        h_routes_per_um, v_routes_per_um, smooth_range=smooth_range,
+    )
     # TILOS concatenates V_cong + H_cong and takes top-5% mean
     flat = torch.cat([v_dem.reshape(K, -1), h_dem.reshape(K, -1)], dim=1)  # [K, 2*Gy*Gx]
     total = flat.shape[1]
@@ -1113,13 +1124,18 @@ class GraphGradPlacer:
         # Joint-release config: unlock hard for last 20% of training.
         # Hard gets pulled toward initial.plc by normalized anchor regularizer,
         # plus a heavy differentiable overlap penalty.  Periodic _legalize keeps
-        # overlap from accumulating.
+        # overlap from accumulating.  Anti-congestion gradient pushes hard
+        # macros away from RUDY hot-spots (bilinear sample of detached demand
+        # map at each hard's position — gradient flows through position only).
         release_step = int(0.80 * self.soft_steps)
         canvas_norm_t = torch.tensor([cw, ch], device=device, dtype=torch.float32).view(1, 1, 2)
         hard_anchor_b = hard_legal_t.unsqueeze(0)  # [1, n_hard, 2] broadcasts on K
-        alpha_anchor = 50.0   # normalized squared drift × 50; drift ~10% canvas → ~0.5 loss
-        alpha_ov = 1000.0     # normalized overlap-area × 1000
+        alpha_anchor = 25.0       # halved from 50 to let hards migrate when anti-cong wants them to
+        alpha_ov = 1000.0         # unchanged; overlap discipline still critical
+        alpha_anti_cong = 5.0     # NEW: weight on anti-cong gradient
+        cong_weight_phase_b = 0.7 # heavier than eval-weight 0.5 during release window
         relegalize_every = 200
+        _diag_printed_b = False   # one-shot diagnostic at first Phase B step
 
         n_steps = self.soft_steps
         for step in range(n_steps):
@@ -1142,7 +1158,42 @@ class GraphGradPlacer:
                 hard_diff_n = (pop[:, :n_hard] - hard_anchor_b) / canvas_norm_t
                 anchor_pen = hard_diff_n.pow(2).mean(dim=(1, 2))  # [K]
                 ov_pen = overlap_loss_hard(pop[:, :n_hard], sizes_hard_t) / (cw * ch)  # [K]
-                loss = (proxy_surr + alpha_anchor * anchor_pen + alpha_ov * ov_pen).sum()
+                # Anti-cong gradient: sample DETACHED RUDY demand at each hard's position
+                # via bilinear interp; gradient flows only through hard positions so they
+                # are pushed toward less-congested cells.
+                h_dem_b, v_dem_b = _tilos_rudy_h_v_demand(
+                    pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                    n_hard, n_macros, grid_col, grid_row, cw, ch,
+                    h_per_um, v_per_um, smooth_range=2,
+                )
+                combined_dem = (h_dem_b.detach() + v_dem_b.detach()).unsqueeze(1)  # [K, 1, Gy, Gx]
+                hard_pos = pop[:, :n_hard]  # [K, n_hard, 2]
+                hard_norm_x = hard_pos[..., 0] / cw * 2.0 - 1.0
+                hard_norm_y = hard_pos[..., 1] / ch * 2.0 - 1.0
+                grid_for_sample = torch.stack([hard_norm_x, hard_norm_y], dim=-1).unsqueeze(2)  # [K, n_hard, 1, 2]
+                cong_at_hard = F.grid_sample(
+                    combined_dem, grid_for_sample,
+                    mode='bilinear', padding_mode='border', align_corners=True,
+                ).squeeze(-1).squeeze(1)  # [K, n_hard]
+                anti_cong = cong_at_hard.mean(dim=1)  # [K]
+                # Phase B uses slightly heavier cong weight in the surrogate
+                proxy_surr_b = wl_n + 0.5 * dens + cong_weight_phase_b * cong
+                loss = (
+                    proxy_surr_b
+                    + alpha_anchor * anchor_pen
+                    + alpha_ov * ov_pen
+                    + alpha_anti_cong * anti_cong
+                ).sum()
+                if not _diag_printed_b:
+                    print(
+                        f"[koral release] phase B start step={step}: "
+                        f"cong.mean={float(cong.mean()):.4f}  "
+                        f"anti_cong.mean={float(anti_cong.mean()):.4f}  "
+                        f"anchor_pen.mean={float(anchor_pen.mean()):.6f}  "
+                        f"ov_pen.mean={float(ov_pen.mean()):.6f}",
+                        flush=True,
+                    )
+                    _diag_printed_b = True
             else:
                 loss = proxy_surr.sum()
             loss.backward()
