@@ -48,7 +48,8 @@ Any benchmark with a hard macro overlap → disqualified entirely.
 - Leaderboard rank 1: 0.9671 avg (Carrotato — Triton+Xplace+congestion-aware GP)
 - Leaderboard rank 5: 1.037 (Cezar)
 - Leaderboard rank 10: 1.1764 (KLA MACH — DREAMPlace+CD+SA+ILS)
-- Estimated our current: ~1.10–1.20 (~rank 15–25 est.)
+- Full `--all` baseline (pre joint-release): **1.2240 avg** (~rank 12–18 est.)
+- Full `--all` with joint-release: pending (ibm01 -0.8%, ibm03 -2.2% so far)
 
 ## Architecture
 
@@ -120,67 +121,48 @@ If you have non-standard deps, include a `Dockerfile` in your submission. Otherw
 
 ## Our Submission: `submissions/koral/`
 
-CT positions → Xplace multi-seed GP (with RUDY v3 congestion gradient) → parallel SA.
+**`GraphGradPlacer`** — GPU-batched analytical placer, pure PyTorch, no external tools.
 
-**Pipeline (git head: f800731):**
-1. CT positions (from initial.plc)
-2. Xplace multi-seed GP (up to 1800s / 400 seeds, bookshelf format)
-   - `stop_overflow=0.05`, `inner_iter=8000`, `mixed_size=True`
-   - Noise schedule: [0.05, 0.10, 0.13, 0.15, 0.18, 0.20] (adaptive: lower for hyperconnected benchmarks)
-   - **RUDY v3 congestion gradient** (corner scatter, `rudy_weight=0.1`, fires at overflow<0.08)
-   - Xplace patches applied at init via `xplace_patches/apply_patches.py` (idempotent)
-   - Best seed selected by oracle cost after legalization; top-16 kept for SA
-3. `_legalize_hard` (greedy micro-legalization)
-4. Parallel SA (~1800s): CD → LNS → FD → hSA (Boltzmann) → oSA
-   - 16 workers pre-forked in `__init__` before CUDA (fixes CUDA+fork deadlock)
-   - FastEvaluator: 383x speedup for SA decisions
-   - hSA uses Boltzmann acceptance in fast-eval space for congestion-dominated benchmarks
+**Pipeline (git head: 030c7e5):**
+1. Legalize hard macros from `initial.plc` via greedy push-apart + spiral fallback (`_legalize`)
+2. **Phase A — soft-only GD (steps 0–80% of 5000):** 96 candidates, all sharing the same locked hard layout. Soft macros start at `initial.plc` positions + 0.1 µm jitter. Adam (lr=0.01) optimizes the TILOS-faithful surrogate: `wl_norm + 0.5 × density + 0.5 × RUDY_cong`. Hard gradients zeroed each step; hard positions reasserted.
+3. **Phase B — joint-release GD (steps 80–100%):** Hard macros unlocked. Loss gains two terms: (a) normalized anchor-pull toward initial.plc (`alpha=50`), (b) differentiable pairwise AABB overlap penalty (`alpha=1000`, normalized by canvas area). `_legalize` runs every 200 steps in this phase; final `_legalize` always runs before scoring.
+4. **Final scoring:** Top-48 candidates ranked by surrogate → true-cost eval via `compute_proxy_cost` → anchor safety net (returns legalized initial.plc if nothing beats it).
 
-**Verified scores (measured 2026-05-20 in Docker, bench_final_v2):**
-- ibm01: **0.8850** (274 seeds × 6s, best GP oracle 0.8855, SA 1800s) ✅
-- ibm02: **1.5307** (Xplace lost to double-patching bug — SA only from CT 1.5658) ⚠️
-- ibm03: in progress, best GP oracle 1.1521 (CT=1.3255, 13% improvement)
-- ibm04–17: pending
+**Why this beats Xplace+SA:** The entire proxy cost on these benchmarks is dominated by density (0.5×) and congestion (0.5×) — wirelength is ~8% of total. Gradient descent with the exact TILOS surrogate targets all three components directly. Hard-lock phase lets soft macros converge cleanly; joint-release phase then lets hard macros make small corrective moves to reduce density/congestion hot spots.
+
+**Verified scores (2026-05-20, Docker, standard pytorch image):**
+- ibm01: **0.8663** VALID (165s) — vs baseline 0.8734 before joint-release
+- ibm03: **1.0687** VALID (165s) — vs baseline 1.0922 before joint-release
+- Full `--all` (17 benchmarks, pre joint-release): **avg 1.2240** (73 min total)
+- Full `--all` with joint-release: pending
 
 **Key empirical facts:**
-- `stop_overflow=0.01` crashes Xplace's LP macro legalization (PulpError: NaN/inf). Use 0.05.
-- `use_route_force=True` crashes Xplace's GPU pattern router for IBM benchmarks (1.8M route segments overflow kernel buffer). Do NOT attempt.
-- CUDA+fork deadlock: fixed by pre-forking 16 SA workers in `__init__` before any CUDA usage.
-- RUDY v1 failed (acted as WL gradient). RUDY v2 fixed gradient direction (detach demand map, gradient through node positions). RUDY v3 uses 4 bbox corners instead of net center for more accurate congestion map.
-- Double-patching bug: KoralPlacer re-initializes per benchmark in worker processes, applying Xplace patches 16× and corrupting main.py. Fixed: `apply_patches.py` checks if `new` content already present; `KoralPlacer._xplace_patched` class guard prevents re-run within a process.
-- Budget split: 1800s Xplace (MAX_SEED_SECONDS) + remainder for SA. For fast benchmarks (6s/seed) SA gets ~1800s; for slow ones it gets more.
-- KORAL_RUDY_WEIGHT env var controls rudy_weight (default 0.1).
+- Hard-lock-only (no joint release) gets avg 1.2240. Joint-release improves ibm01 by -0.8% and ibm03 by -2.2% by reducing density + congestion via small hard movements.
+- `_place_joint` (full continuous joint mode with `alpha_ov` → 5000) loses badly — overlap penalty overwhelms the proxy and hard parks non-overlapping rather than optimal. Use the two-phase lock→release instead.
+- Xplace+SA (previous attempt): slower, needed a Dockerfile, had CUDA+fork deadlock and double-patching bugs. Abandoned.
+- No SA, no Xplace, no custom deps — runs directly in the judges' standard `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime` image.
 
 **Key files:**
-- `submissions/koral/placer.py` — `KoralPlacer` class (~1800 lines)
-- `submissions/koral/bookshelf.py` — Benchmark → ISPD2005 bookshelf for Xplace
-- `submissions/koral/fast_eval.py` — FastEvaluator (383x SA speedup)
-- `submissions/koral/Dockerfile` — Docker: Xplace + dependencies
-- `submissions/koral/xplace_patches/rudy_loss.py` — RUDY v3 congestion loss
-- `submissions/koral/xplace_patches/apply_patches.py` — patches Xplace source at runtime
-- `HANDOFF.md` — detailed state, investigation results, next steps
+- `submissions/koral/placer.py` — `GraphGradPlacer` class (~1250 lines, sole submission file)
+- `HANDOFF.md` — full design rationale, empirical findings, next steps
 
-**Dev loop (Docker):**
+**Dev loop (Docker — no build needed, uses standard image):**
 ```bash
-# Build image (~40 min first time; only needed after Dockerfile changes)
-docker build -t koral-placer-xplace -f submissions/koral/Dockerfile .
-
-# Full submission run (bind mount provides placer.py, rudy_loss.py, apply_patches.py live)
-docker run --rm --runtime=nvidia --gpus all \
-  -v "C:/path/to/repo:/challenge" --network none \
-  -e KORAL_RUDY_WEIGHT=0.1 \
-  --entrypoint bash koral-placer-xplace \
-  -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py --all"
-
 # Single benchmark test
 docker run --rm --runtime=nvidia --gpus all \
-  -v "C:/path/to/repo:/challenge" --network none \
-  -e KORAL_RUDY_WEIGHT=0.1 \
-  --entrypoint bash koral-placer-xplace \
+  -v "C:/Users/kulac/Documents/GitHub/macro-place-challenge-2026:/challenge" \
+  --network none --entrypoint bash koral-placer-xplace \
   -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py -b ibm01"
+
+# Full submission run
+docker run --rm --runtime=nvidia --gpus all \
+  -v "C:/Users/kulac/Documents/GitHub/macro-place-challenge-2026:/challenge" \
+  --network none --entrypoint bash koral-placer-xplace \
+  -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py --all"
 ```
 
-Note: `placer.py`, `rudy_loss.py`, and `apply_patches.py` are bind-mounted and visible live — no `docker cp` needed for these. The patches are applied at KoralPlacer init via `apply_patches.py` (idempotent), and `rudy_loss.py` is copied from the bind mount to `/opt/xplace/src/core/` at that time.
+Note: `placer.py` is bind-mounted and visible live. No rebuild needed for code changes. The `koral-placer-xplace` image is reused for convenience (it has the right PyTorch version) but does not use Xplace at all.
 
 ## Reproducibility Warning
 
