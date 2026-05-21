@@ -119,7 +119,7 @@ The `will_seed` placer ([submissions/will_seed/placer.py](submissions/will_seed/
 
 If you have non-standard deps, include a `Dockerfile` in your submission. Otherwise your `placer.py` is mounted into the judges' standard image.
 
-## Our Submission: `submissions/koral/`
+## Our Submission: `submissions/idk/`
 
 **`LKPlacer`** — Five-phase placer: focused electrostatic GP front-end → Lin-Kernighan k-opt refinement → LAHC (Late Acceptance Hill Climbing) deep polish. Pure PyTorch + NumPy, no external tools, no Docker rebuild required.
 
@@ -161,9 +161,8 @@ If you have non-standard deps, include a `Dockerfile` in your submission. Otherw
 - ibm12: **1.2035** VALID (3015s = 50.3 min) — beats our prior best (1.3248) by 9.2%, beats RePlAce baseline (1.7261) by 30%.
 
 **Key files:**
-- `submissions/koral/placer.py` — `LKPlacer` main class + FastEvaluator + LK/LAHC bodies (~1380 lines)
-- `submissions/koral/gp.py` — Phase α focused electrostatic GP (FFT Poisson solver, RUDY surrogate, multi-replica with REX)
-- `submissions/koral/placer_old.py`, `fast_eval.py`, `bookshelf.py`, etc. — dead, kept for reference
+- `submissions/idk/placer.py` — `LKPlacer` main class + FastEvaluator + LK/LAHC bodies (~1380 lines)
+- `submissions/idk/gp.py` — Phase α focused electrostatic GP (FFT Poisson solver, RUDY surrogate, multi-replica with REX)
 
 **Dev loop (Docker — no build needed, uses standard pytorch image):**
 ```bash
@@ -171,13 +170,13 @@ If you have non-standard deps, include a `Dockerfile` in your submission. Otherw
 docker run --rm --runtime=nvidia --gpus all \
   -v "C:/Users/kulac/Documents/GitHub/macro-place-challenge-2026:/challenge" \
   --network none --entrypoint bash koral-placer-xplace \
-  -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py -b ibm01 --vis"
+  -c "cd /challenge && python3 -m macro_place.evaluate submissions/idk/placer.py -b ibm01 --vis"
 
 # Full submission run
 docker run --rm --runtime=nvidia --gpus all \
   -v "C:/Users/kulac/Documents/GitHub/macro-place-challenge-2026:/challenge" \
   --network none --entrypoint bash koral-placer-xplace \
-  -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py --all"
+  -c "cd /challenge && python3 -m macro_place.evaluate submissions/idk/placer.py --all"
 ```
 
 Both `placer.py` and `gp.py` are bind-mounted live. The `koral-placer-xplace` image is reused only for its PyTorch version — Xplace is no longer used.
