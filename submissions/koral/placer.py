@@ -250,6 +250,65 @@ def _grid_fill(n: int, cw: float, ch: float) -> np.ndarray:
     return pos
 
 
+def _grid_seeded_hard(
+    sizes: np.ndarray,  # [n_hard, 2]
+    cw: float,
+    ch: float,
+    seed: int = 0,
+    jitter_frac: float = 0.08,
+) -> np.ndarray:
+    """
+    Distribute hard macros uniformly across the canvas on a size-aware grid.
+
+    Anti-ring starting basin: large macros take the central cells (room to
+    breathe), smaller macros take the peripheral cells.  Subsequent gradient
+    descent + legalization then refine within this basin.  Differs from
+    _grid_fill in three ways: aspect-ratio-aware cols/rows, area-sorted macro
+    assignment to center-distance-sorted cells, and RNG jitter so multiple
+    grid seeds are not duplicates.
+    """
+    rng = np.random.default_rng(seed)
+    n_hard = sizes.shape[0]
+    if n_hard == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    # Aspect-aware grid dimensions
+    aspect = cw / max(ch, 1e-6)
+    cols = max(1, int(math.ceil(math.sqrt(n_hard * aspect))))
+    rows = max(1, int(math.ceil(n_hard / cols)))
+    cell_w = cw / cols
+    cell_h = ch / rows
+
+    # Enumerate cell centers
+    cell_positions = []
+    for r in range(rows):
+        for c in range(cols):
+            cell_positions.append(((c + 0.5) * cell_w, (r + 0.5) * cell_h))
+    cell_positions = np.array(cell_positions[: rows * cols], dtype=np.float64)
+    # Trim to n_hard, ordered by distance from canvas centre (central cells first)
+    canvas_centre = np.array([cw / 2.0, ch / 2.0])
+    cell_d = np.linalg.norm(cell_positions - canvas_centre, axis=1)
+    cell_order = np.argsort(cell_d)[:n_hard]
+    cell_positions = cell_positions[cell_order]
+
+    # Assign macros to cells: largest-area macros to closest-to-centre cells
+    areas = sizes[:, 0] * sizes[:, 1]
+    macro_order = np.argsort(-areas)
+    out = np.zeros((n_hard, 2), dtype=np.float64)
+    for slot, m_idx in enumerate(macro_order):
+        out[m_idx] = cell_positions[slot]
+
+    # Jitter (per-seed diversity); scale by cell size
+    out += rng.standard_normal((n_hard, 2)) * np.array([cell_w, cell_h]) * jitter_frac
+
+    # Clamp inside canvas with macro-half margin
+    half_w = sizes[:, 0] / 2.0
+    half_h = sizes[:, 1] / 2.0
+    margin = 0.005
+    out[:, 0] = np.clip(out[:, 0], half_w + margin, cw - half_w - margin)
+    out[:, 1] = np.clip(out[:, 1], half_h + margin, ch - half_h - margin)
+    return out
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Legalization (vectorized push-apart + spiral fallback) — float32-aware
 # ────────────────────────────────────────────────────────────────────────────
@@ -263,6 +322,7 @@ def _legalize_spread(
     ch: float,
     gap: float = 0.005,
     max_iters: int = 400,
+    preserve_centroid: bool = True,
 ) -> Tuple[np.ndarray, bool]:
     n = pos.shape[0]
     out = pos.copy()
@@ -276,6 +336,13 @@ def _legalize_spread(
             out[k] = pos[k]
     out[:, 0] = np.clip(out[:, 0], half_w + bmargin, cw - half_w - bmargin)
     out[:, 1] = np.clip(out[:, 1], half_h + bmargin, ch - half_h - bmargin)
+    # C1: snapshot movable centroid AFTER initial clamp; we will pull the
+    # movable cloud back toward this reference each iteration to counter the
+    # outward bias from canvas-wall pushes (root cause of the ring pattern).
+    if movable.any():
+        ref_centroid = out[movable].mean(axis=0)
+    else:
+        ref_centroid = np.zeros(2)
     safety = max(gap * 0.5, 1e-5)
     buffer = gap
     for _ in range(max_iters):
@@ -298,6 +365,12 @@ def _legalize_spread(
         out[movable, 0] += contrib_x.sum(axis=1)[movable]
         out[movable, 1] += contrib_y.sum(axis=1)[movable]
         out[~movable] = pos[~movable]
+        # C1: re-center movable cloud BEFORE clamping so corrections aren't
+        # eaten by the wall. Damp by 0.5 to avoid oscillation against the push.
+        if preserve_centroid and movable.any():
+            new_centroid = out[movable].mean(axis=0)
+            drift = new_centroid - ref_centroid
+            out[movable] -= 0.5 * drift
         out[:, 0] = np.clip(out[:, 0], half_w + bmargin, cw - half_w - bmargin)
         out[:, 1] = np.clip(out[:, 1], half_h + bmargin, ch - half_h - bmargin)
     out_f32 = out.astype(np.float32).astype(np.float64)
@@ -653,6 +726,65 @@ def tilos_density_loss(
     return 0.5 * (top_sum / k_top)  # [K]  — matches get_density_cost()
 
 
+def uniform_density_loss(
+    pop: torch.Tensor,
+    sizes: torch.Tensor,
+    grid_col: int,
+    grid_row: int,
+    cw: float,
+    ch: float,
+) -> torch.Tensor:
+    """
+    D: Mean-squared deviation of per-cell density from the uniform target.
+
+    target = total_macro_area / canvas_area
+    loss   = mean over cells of (cell_density - target)^2
+
+    tilos_density_loss only penalises the top-10% hot spots; that's a
+    one-sided pressure that's silent about under-filled regions.  This term
+    is symmetric: it equally punishes "too empty" (the donut hole at the
+    centre of the ring-pattern benchmarks) and "too full" cells.  Together
+    they drive the layout toward uniform spread.
+
+    Returns [K].
+    """
+    K, N, _ = pop.shape
+    grid_w = cw / grid_col
+    grid_h = ch / grid_row
+    grid_area = grid_w * grid_h
+
+    col_idx = torch.arange(grid_col, device=pop.device, dtype=pop.dtype)
+    row_idx = torch.arange(grid_row, device=pop.device, dtype=pop.dtype)
+    col_l = col_idx * grid_w
+    col_r = col_l + grid_w
+    row_b = row_idx * grid_h
+    row_t = row_b + grid_h
+
+    x = pop[..., 0]
+    y = pop[..., 1]
+    hw = sizes[:, 0] / 2
+    hh = sizes[:, 1] / 2
+    macro_l = (x - hw.unsqueeze(0)).unsqueeze(-1)
+    macro_r = (x + hw.unsqueeze(0)).unsqueeze(-1)
+    macro_b_ = (y - hh.unsqueeze(0)).unsqueeze(-1)
+    macro_t_ = (y + hh.unsqueeze(0)).unsqueeze(-1)
+    col_lb = col_l.view(1, 1, grid_col)
+    col_rb = col_r.view(1, 1, grid_col)
+    row_bb = row_b.view(1, 1, grid_row)
+    row_tb = row_t.view(1, 1, grid_row)
+
+    x_ov = (torch.min(macro_r, col_rb) - torch.max(macro_l, col_lb)).clamp(min=0.0)
+    y_ov = (torch.min(macro_t_, row_tb) - torch.max(macro_b_, row_bb)).clamp(min=0.0)
+    occupied = torch.einsum("knx,kny->kyx", x_ov, y_ov)  # [K, Gy, Gx]
+    density = occupied / grid_area  # [K, Gy, Gx]
+
+    total_macro_area = (sizes[:, 0] * sizes[:, 1]).sum()
+    canvas_area = cw * ch
+    target = total_macro_area / canvas_area  # scalar
+
+    return ((density - target) ** 2).mean(dim=(1, 2))  # [K]
+
+
 def tilos_wl_normalized(
     pop: torch.Tensor,
     owner_idx: torch.Tensor,
@@ -790,6 +922,156 @@ def tilos_rudy_normalized(
     return sorted_c[:, :k_top].mean(dim=1)  # [K]
 
 
+def compute_cell_congestion(
+    pop: torch.Tensor,
+    owner_idx: torch.Tensor,
+    pin_off: torch.Tensor,
+    net_id: torch.Tensor,
+    n_nets: int,
+    port_pos: torch.Tensor,
+    n_hard: int,
+    n_macros: int,
+    grid_col: int,
+    grid_row: int,
+    cw: float,
+    ch: float,
+    h_routes_per_um: float,
+    v_routes_per_um: float,
+    smooth_range: int = 2,
+) -> torch.Tensor:
+    """
+    Per-cell congestion field [K, Gy, Gx] = max(H_smoothed, V_smoothed).
+
+    Same internal computation as tilos_rudy_normalized through the smoothing
+    step, but returns the full field instead of the top-K%-mean scalar.
+    Used by hard_congestion_pull (A) — the field is treated as a *target*
+    (detach() before use) so the pull doesn't chase its own tail.
+    """
+    K = pop.shape[0]
+    device = pop.device
+    n_ports = port_pos.shape[0]
+    if n_ports > 0:
+        ports_b = port_pos.unsqueeze(0).expand(K, n_ports, 2)
+        owner_pos = torch.cat([pop, ports_b], dim=1)
+    else:
+        owner_pos = pop
+    pin_pos = owner_pos[:, owner_idx, :] + pin_off.unsqueeze(0)
+    x = pin_pos[..., 0]
+    y = pin_pos[..., 1]
+    idx = net_id.unsqueeze(0).expand(K, -1)
+    big = 1e9
+    x_max = torch.full((K, n_nets), -big, device=device, dtype=pop.dtype)
+    x_min = torch.full((K, n_nets), big, device=device, dtype=pop.dtype)
+    y_max = torch.full((K, n_nets), -big, device=device, dtype=pop.dtype)
+    y_min = torch.full((K, n_nets), big, device=device, dtype=pop.dtype)
+    x_max.scatter_reduce_(1, idx, x, reduce="amax", include_self=True)
+    x_min.scatter_reduce_(1, idx, x, reduce="amin", include_self=True)
+    y_max.scatter_reduce_(1, idx, y, reduce="amax", include_self=True)
+    y_min.scatter_reduce_(1, idx, y, reduce="amin", include_self=True)
+    bbox_w = (x_max - x_min).clamp(min=1e-3)
+    bbox_h = (y_max - y_min).clamp(min=1e-3)
+
+    grid_w = cw / grid_col
+    grid_h = ch / grid_row
+    col_idx = torch.arange(grid_col, device=device, dtype=pop.dtype)
+    row_idx = torch.arange(grid_row, device=device, dtype=pop.dtype)
+    col_l = col_idx * grid_w
+    col_r = col_l + grid_w
+    row_b = row_idx * grid_h
+    row_t = row_b + grid_h
+    bxl = x_min.unsqueeze(-1); bxr = x_max.unsqueeze(-1)
+    byb = y_min.unsqueeze(-1); byt = y_max.unsqueeze(-1)
+    col_lb = col_l.view(1, 1, grid_col); col_rb = col_r.view(1, 1, grid_col)
+    row_bb = row_b.view(1, 1, grid_row); row_tb = row_t.view(1, 1, grid_row)
+    x_ov = (torch.min(bxr, col_rb) - torch.max(bxl, col_lb)).clamp(min=0.0)
+    y_ov = (torch.min(byt, row_tb) - torch.max(byb, row_bb)).clamp(min=0.0)
+    inv_h = (1.0 / bbox_h).unsqueeze(-1)
+    inv_w = (1.0 / bbox_w).unsqueeze(-1)
+    h_per_n_x = inv_h * x_ov
+    v_per_n_x = inv_w * x_ov
+    h_dem = torch.einsum("knx,kny->kyx", h_per_n_x, y_ov)
+    v_dem = torch.einsum("knx,kny->kyx", v_per_n_x, y_ov)
+    grid_v_routes = grid_w * v_routes_per_um
+    grid_h_routes = grid_h * h_routes_per_um
+    v_dem = v_dem / max(grid_v_routes, 1e-9)
+    h_dem = h_dem / max(grid_h_routes, 1e-9)
+    if smooth_range > 0:
+        ksz = 2 * smooth_range + 1
+        v_dem_r = v_dem.unsqueeze(1)
+        h_dem_r = h_dem.unsqueeze(1)
+        kx = torch.ones(1, 1, 1, ksz, device=device, dtype=pop.dtype) / ksz
+        ky = torch.ones(1, 1, ksz, 1, device=device, dtype=pop.dtype) / ksz
+        v_dem = torch.nn.functional.conv2d(v_dem_r, kx, padding=(0, smooth_range)).squeeze(1)
+        h_dem = torch.nn.functional.conv2d(h_dem_r, ky, padding=(smooth_range, 0)).squeeze(1)
+    return torch.maximum(v_dem, h_dem)  # [K, Gy, Gx]
+
+
+def hard_congestion_pull(
+    pop: torch.Tensor,
+    sizes: torch.Tensor,
+    cell_cong_target: torch.Tensor,  # [K, Gy, Gx]  — MUST be detached
+    n_hard: int,
+    grid_col: int,
+    grid_row: int,
+    cw: float,
+    ch: float,
+) -> torch.Tensor:
+    """
+    A: Attractive pull of hard macros toward high-congestion cells.
+
+    Hard macros are physical obstacles: dropping one into a congestion hot
+    spot displaces routing demand around it, breaking up the hot zone.  The
+    raw RUDY loss only attacks congestion *indirectly* by shrinking net
+    bboxes; this term gives a direct "go plug the hole" gradient.
+
+    loss = -sum_over_cells(hard_macro_occupied_area × cell_cong_target)
+    The minus sign means minimising the loss *maximises* overlap of hard
+    macros with hot cells.  Normalized by (total_hard_area × mean_cong) so
+    the per-K value is roughly O(1) — independent of benchmark size.
+
+    cell_cong_target MUST be detached or the gradient will chase itself
+    (the field depends on positions through bbox/RUDY, so leaving it
+    attached creates an unstable feedback loop).
+    """
+    K = pop.shape[0]
+    grid_w = cw / grid_col
+    grid_h = ch / grid_row
+
+    col_idx = torch.arange(grid_col, device=pop.device, dtype=pop.dtype)
+    row_idx = torch.arange(grid_row, device=pop.device, dtype=pop.dtype)
+    col_l = col_idx * grid_w
+    col_r = col_l + grid_w
+    row_b = row_idx * grid_h
+    row_t = row_b + grid_h
+
+    pos_h = pop[:, :n_hard]
+    sizes_h = sizes[:n_hard]
+    x = pos_h[..., 0]
+    y = pos_h[..., 1]
+    hw = sizes_h[:, 0] / 2
+    hh = sizes_h[:, 1] / 2
+    macro_l = (x - hw.unsqueeze(0)).unsqueeze(-1)
+    macro_r = (x + hw.unsqueeze(0)).unsqueeze(-1)
+    macro_b_ = (y - hh.unsqueeze(0)).unsqueeze(-1)
+    macro_t_ = (y + hh.unsqueeze(0)).unsqueeze(-1)
+    col_lb = col_l.view(1, 1, grid_col); col_rb = col_r.view(1, 1, grid_col)
+    row_bb = row_b.view(1, 1, grid_row); row_tb = row_t.view(1, 1, grid_row)
+
+    x_ov = (torch.min(macro_r, col_rb) - torch.max(macro_l, col_lb)).clamp(min=0.0)
+    y_ov = (torch.min(macro_t_, row_tb) - torch.max(macro_b_, row_bb)).clamp(min=0.0)
+    # Aggregate per-cell occupied by all hard macros: [K, Gy, Gx]
+    occupied = torch.einsum("knx,kny->kyx", x_ov, y_ov)
+
+    # Raw pull magnitude: high when occupied aligns with hot cells.
+    # We minimize -pull, so this is a negative number.
+    raw_pull = -(occupied * cell_cong_target).sum(dim=(1, 2))  # [K]
+
+    # Normalize so the term is O(1) regardless of benchmark size.
+    total_hard_area = (sizes_h[:, 0] * sizes_h[:, 1]).sum().clamp(min=1e-6)
+    mean_cong = cell_cong_target.mean(dim=(1, 2)).clamp(min=1e-6)  # [K]
+    return raw_pull / (total_hard_area * mean_cong)  # [K]
+
+
 def anchor_reg(
     pop: torch.Tensor, anchor: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
@@ -908,10 +1190,11 @@ def _build_population_seeds(
     if K == 1:
         return pop
 
-    # Budget seed slots: roughly 1/8 spectral, 1/4 FD-random, rest jittered.
+    # Budget seed slots: 1/8 spectral, 1/4 FD-random, 1/8 grid, rest jittered.
     # Always clamp to fit in [1, K-1].
     n_spec = max(1, K // 8) if K >= 8 else 0
     n_fd = max(1, K // 4) if K >= 4 else 0
+    n_grid = max(1, K // 8) if K >= 8 else 0
     # If small K, fall back to just jittered anchor (cheapest, safest)
     used = 1
     # Seeds 1..n_spec: spectral with random rotations
@@ -932,6 +1215,18 @@ def _build_population_seeds(
         fd = _force_directed_init(edges, weights, n_hard, cw, ch, iters=int(iters_), seed=seed + k * 7)
         fd_leg = _legalize(fd, sizes_np, movable_np, cw, ch, gap=0.005)
         pop[k, :n_hard] = fd_leg
+        pop[k, n_hard:, 0] = cw / 2 + rng.normal(0, cw * 0.25, n_macros - n_hard)
+        pop[k, n_hard:, 1] = ch / 2 + rng.normal(0, ch * 0.25, n_macros - n_hard)
+        used = k + 1
+    # E: grid-distributed seeds — anti-ring starting basin.  Hard macros placed
+    # on an aspect-aware uniform grid sized to canvas, largest macros central,
+    # smallest peripheral.  Multiple seeds differ by RNG jitter.
+    for k in range(used, used + n_grid):
+        if k >= K:
+            break
+        grid_hard = _grid_seeded_hard(sizes_np, cw, ch, seed=seed + 13 * k)
+        grid_leg = _legalize(grid_hard, sizes_np, movable_np, cw, ch, gap=0.005)
+        pop[k, :n_hard] = grid_leg
         pop[k, n_hard:, 0] = cw / 2 + rng.normal(0, cw * 0.25, n_macros - n_hard)
         pop[k, n_hard:, 1] = ch / 2 + rng.normal(0, ch * 0.25, n_macros - n_hard)
         used = k + 1
@@ -1088,7 +1383,7 @@ class GraphGradPlacer:
         h_per_um = float(benchmark.hroutes_per_micron)
         v_per_um = float(benchmark.vroutes_per_micron)
 
-        # Legalize hard macros once at initial.plc → anchor.
+        # Legalize hard macros once at initial.plc → anchor for safety net.
         init_pos = benchmark.macro_positions[:n_hard].numpy().astype(np.float64)
         hard_legal = _legalize(init_pos, sizes_np, movable_np, cw, ch, gap=0.005)
         hard_legal_t = torch.tensor(hard_legal, device=device, dtype=torch.float32)
@@ -1101,26 +1396,49 @@ class GraphGradPlacer:
             f"device={device}"
         )
 
-        # Population: all 96 candidates share the locked hard layout; soft
-        # starts at initial soft + small jitter (proven baseline).
+        # E: per-candidate hard layouts.  Slot 0 = legalized initial.plc
+        # (preserved for safety net). Slots 1..n_grid = grid-distributed
+        # anti-ring starts. Remaining = jittered initial.plc.  Each candidate's
+        # hard layout is also its own anchor for the Phase B pull.
         K = self.pop_size
+        rng_np = np.random.default_rng(run_seed)
+        n_grid = max(1, K // 4) if K >= 4 else 0  # 25% of population on grid seeds
+        hard_layouts = np.zeros((K, n_hard, 2), dtype=np.float64)
+        hard_layouts[0] = hard_legal
+        for k in range(1, min(1 + n_grid, K)):
+            grid_h = _grid_seeded_hard(sizes_np, cw, ch, seed=run_seed + 17 * k)
+            hard_layouts[k] = _legalize(grid_h, sizes_np, movable_np, cw, ch, gap=0.005)
+        for k in range(1 + n_grid, K):
+            jit_scale = 0.02 + 0.10 * rng_np.random()
+            jitter = rng_np.standard_normal((n_hard, 2)) * (min(cw, ch) * jit_scale)
+            jitter[~movable_np] = 0.0
+            hard_layouts[k] = _legalize(
+                hard_legal + jitter, sizes_np, movable_np, cw, ch, gap=0.005,
+            )
+        hard_layouts_t = torch.tensor(hard_layouts, device=device, dtype=torch.float32)  # [K, n_hard, 2]
+
         pop = torch.zeros(K, n_macros, 2, device=device, dtype=torch.float32)
-        pop[:, :n_hard] = hard_legal_t
+        pop[:, :n_hard] = hard_layouts_t
         pop[:, n_hard:] = soft_anchor + torch.randn(K, n_soft, 2, device=device) * 0.1
         pop.requires_grad_(True)
         opt = torch.optim.Adam([pop], lr=self.soft_lr)
 
         # Joint-release config: unlock hard for last 20% of training.
-        # Hard gets pulled toward initial.plc by normalized anchor regularizer,
-        # plus a heavy differentiable overlap penalty.  Periodic _legalize keeps
-        # overlap from accumulating.
+        # Hard gets pulled toward its PER-CANDIDATE anchor (so grid-seeded
+        # candidates aren't dragged back to initial.plc), plus a heavy
+        # differentiable overlap penalty.  Periodic _legalize keeps
+        # accumulated overlap small.
         release_step = int(0.80 * self.soft_steps)
         canvas_norm_t = torch.tensor([cw, ch], device=device, dtype=torch.float32).view(1, 1, 2)
-        hard_anchor_b = hard_legal_t.unsqueeze(0)  # [1, n_hard, 2] broadcasts on K
+        hard_anchor_b = hard_layouts_t  # [K, n_hard, 2] — per-candidate anchor
         alpha_anchor = 50.0   # normalized squared drift × 50; drift ~10% canvas → ~0.5 loss
         alpha_ov = 1000.0     # normalized overlap-area × 1000
+        alpha_unif = 2.0      # D: uniform-density MSE penalty
+        alpha_pull = 1.0      # A: congestion-gradient pull on hard macros (Phase B only)
+        cong_refresh_every = 50  # A: how often to refresh the detached cong target
         relegalize_every = 200
 
+        cell_cong_target = None  # A: lazily initialised inside Phase B
         n_steps = self.soft_steps
         for step in range(n_steps):
             opt.zero_grad()
@@ -1136,13 +1454,33 @@ class GraphGradPlacer:
                 n_hard, n_macros, grid_col, grid_row, cw, ch,
                 h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
             )
-            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong  # mirrors compute_proxy_cost, [K]
+            unif = uniform_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)  # D
+            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong + alpha_unif * unif  # mirrors compute_proxy_cost + D
             in_joint = step >= release_step
             if in_joint:
                 hard_diff_n = (pop[:, :n_hard] - hard_anchor_b) / canvas_norm_t
                 anchor_pen = hard_diff_n.pow(2).mean(dim=(1, 2))  # [K]
                 ov_pen = overlap_loss_hard(pop[:, :n_hard], sizes_hard_t) / (cw * ch)  # [K]
-                loss = (proxy_surr + alpha_anchor * anchor_pen + alpha_ov * ov_pen).sum()
+                # A: refresh detached cell-congestion target every N steps,
+                # then add the pull term that attracts hard macros into hot cells.
+                rel_step = step - release_step
+                if cell_cong_target is None or rel_step % cong_refresh_every == 0:
+                    with torch.no_grad():
+                        cell_cong_target = compute_cell_congestion(
+                            pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                            n_hard, n_macros, grid_col, grid_row, cw, ch,
+                            h_per_um, v_per_um, smooth_range=2,
+                        ).detach()
+                pull = hard_congestion_pull(
+                    pop, sizes_all, cell_cong_target,
+                    n_hard, grid_col, grid_row, cw, ch,
+                )
+                loss = (
+                    proxy_surr
+                    + alpha_anchor * anchor_pen
+                    + alpha_ov * ov_pen
+                    + alpha_pull * pull
+                ).sum()
             else:
                 loss = proxy_surr.sum()
             loss.backward()
@@ -1155,7 +1493,7 @@ class GraphGradPlacer:
                 pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
                 if not in_joint:
-                    pop[:, :n_hard] = hard_legal_t  # reassert lock
+                    pop[:, :n_hard] = hard_layouts_t  # reassert per-candidate lock
                 else:
                     # Clamp hard to canvas during joint phase
                     pop[:, :n_hard, 0].clamp_(min=half_w_t[:n_hard], max=cw - half_w_t[:n_hard])
