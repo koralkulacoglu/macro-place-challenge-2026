@@ -153,6 +153,8 @@ class FastEvaluator:
         self.gw = self.cw / self.grid_col
         self.gh = self.ch / self.grid_row
         self.grid_area = self.gw * self.gh
+        self._inv_gw = 1.0 / self.gw if self.gw > 0 else 0.0
+        self._inv_gh = 1.0 / self.gh if self.gh > 0 else 0.0
         self.h_per_um = float(benchmark.hroutes_per_micron)
         self.v_per_um = float(benchmark.vroutes_per_micron)
         self.grid_v_routes = self.gw * self.v_per_um
@@ -199,6 +201,12 @@ class FastEvaluator:
         for n in range(self.n_nets):
             for o in self.net_owner[n]:
                 self._owner_to_nets.setdefault(int(o), []).append(n)
+        # Per-net macro/port split — port pins are constant so we precompute
+        # their grid cells and bbox once.  Macro pins still need per-move recompute.
+        self._build_per_net_split()
+        # Cached cell topology per net (populated by +1 recompute, reused by -1 undo).
+        self._net_cells_set: List[Optional[set]] = [None] * self.n_nets
+        self._net_src: List[Optional[Tuple[int, int]]] = [None] * self.n_nets
         # Grids
         self.density_grid = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
         self.h_pin_cong = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
@@ -242,6 +250,76 @@ class FastEvaluator:
             self.net_offx.append(offx)
             self.net_offy.append(offy)
 
+    def _build_per_net_split(self):
+        """Split each net's owners into macro and port halves.
+
+        Port pins are fixed for the whole run, so we precompute their pin
+        positions, grid cells, and per-net bbox once.  Per-move only the macro
+        pins need recomputation.
+        """
+        n_nets = self.n_nets
+        # Per-net macro arrays (indices, offsets)
+        self.net_m_idx: List[np.ndarray] = [None] * n_nets
+        self.net_m_offx: List[np.ndarray] = [None] * n_nets
+        self.net_m_offy: List[np.ndarray] = [None] * n_nets
+        # Per-net port arrays (cells, world coords)
+        self.net_p_r: List[np.ndarray] = [None] * n_nets
+        self.net_p_c: List[np.ndarray] = [None] * n_nets
+        self.net_p_xmin = np.zeros(n_nets, dtype=np.float64)
+        self.net_p_xmax = np.zeros(n_nets, dtype=np.float64)
+        self.net_p_ymin = np.zeros(n_nets, dtype=np.float64)
+        self.net_p_ymax = np.zeros(n_nets, dtype=np.float64)
+        self.net_has_macros = np.zeros(n_nets, dtype=bool)
+        self.net_has_ports = np.zeros(n_nets, dtype=bool)
+        # Driver pin marker: positive = idx into macro list, negative-1 = idx into port list.
+        # We need the driver cell to be `cells[0]` source for _route_pin_cong topology.
+        self.net_driver_is_macro = np.zeros(n_nets, dtype=bool)
+        self.net_driver_local = np.zeros(n_nets, dtype=np.int64)
+        for n in range(n_nets):
+            owners = self.net_owner[n]
+            if owners.size == 0:
+                self.net_m_idx[n] = np.zeros(0, dtype=np.int64)
+                self.net_m_offx[n] = np.zeros(0)
+                self.net_m_offy[n] = np.zeros(0)
+                self.net_p_r[n] = np.zeros(0, dtype=np.int64)
+                self.net_p_c[n] = np.zeros(0, dtype=np.int64)
+                continue
+            is_macro = owners < self.n_macros
+            is_port = ~is_macro
+            offx = self.net_offx[n]
+            offy = self.net_offy[n]
+            if is_macro.any():
+                self.net_has_macros[n] = True
+                self.net_m_idx[n] = owners[is_macro].astype(np.int64)
+                self.net_m_offx[n] = offx[is_macro].astype(np.float64)
+                self.net_m_offy[n] = offy[is_macro].astype(np.float64)
+            else:
+                self.net_m_idx[n] = np.zeros(0, dtype=np.int64)
+                self.net_m_offx[n] = np.zeros(0)
+                self.net_m_offy[n] = np.zeros(0)
+            if is_port.any():
+                self.net_has_ports[n] = True
+                p_local = owners[is_port] - self.n_macros
+                p_offx = offx[is_port]
+                p_offy = offy[is_port]
+                pxs = self.port_pos[p_local, 0] + p_offx
+                pys = self.port_pos[p_local, 1] + p_offy
+                self.net_p_xmin[n] = pxs.min()
+                self.net_p_xmax[n] = pxs.max()
+                self.net_p_ymin[n] = pys.min()
+                self.net_p_ymax[n] = pys.max()
+                p_c = np.clip((pxs * self._inv_gw).astype(np.int64), 0, self.grid_col - 1)
+                p_r = np.clip((pys * self._inv_gh).astype(np.int64), 0, self.grid_row - 1)
+                self.net_p_c[n] = p_c
+                self.net_p_r[n] = p_r
+            else:
+                self.net_p_r[n] = np.zeros(0, dtype=np.int64)
+                self.net_p_c[n] = np.zeros(0, dtype=np.int64)
+            # Driver = owners[0]; since the macro/port sublists preserve
+            # source order, owners[0]'s local idx is always 0 in its sublist.
+            self.net_driver_is_macro[n] = bool(is_macro[0])
+            self.net_driver_local[n] = 0
+
     def _fetch_net_weights(self, plc):
         try:
             driver_names = list(plc.nets.keys())
@@ -270,12 +348,29 @@ class FastEvaluator:
         return out
 
     def _net_bbox(self, n):
-        owners = self.net_owner[n]
-        if owners.size == 0:
+        has_m = self.net_has_macros[n]
+        has_p = self.net_has_ports[n]
+        if not has_m and not has_p:
             return 0.0, 0.0, 0.0, 0.0
-        xs = self._pin_x(owners, self.net_offx[n])
-        ys = self._pin_y(owners, self.net_offy[n])
-        return xs.min(), ys.min(), xs.max(), ys.max()
+        if not has_m:
+            return self.net_p_xmin[n], self.net_p_ymin[n], self.net_p_xmax[n], self.net_p_ymax[n]
+        m_idx = self.net_m_idx[n]
+        mxs = self.positions[m_idx, 0] + self.net_m_offx[n]
+        mys = self.positions[m_idx, 1] + self.net_m_offy[n]
+        xmin = mxs.min()
+        xmax = mxs.max()
+        ymin = mys.min()
+        ymax = mys.max()
+        if has_p:
+            pxmn = self.net_p_xmin[n]
+            pxmx = self.net_p_xmax[n]
+            pymn = self.net_p_ymin[n]
+            pymx = self.net_p_ymax[n]
+            if pxmn < xmin: xmin = pxmn
+            if pxmx > xmax: xmax = pxmx
+            if pymn < ymin: ymin = pymn
+            if pymx > ymax: ymax = pymx
+        return xmin, ymin, xmax, ymax
 
     def _grid_cell(self, x, y):
         c = int(math.floor(x / self.gw))
@@ -346,31 +441,120 @@ class FastEvaluator:
                 if dy > 0:
                     self.h_macro_cong[r, c] -= sign * dy * self.h_alloc
 
-    def _route_pin_cong(self, net_idx, sign=+1):
-        owners = self.net_owner[net_idx]
-        if owners.size == 0:
+    def _route_pin_cong_apply(self, net_idx, sign):
+        """Apply the cached cell-topology contribution for `net_idx` with `sign`.
+        Cache must have been populated by a prior `_route_pin_cong_recompute(+1)`.
+        Used as the undo path on the -1 side of move_macro."""
+        cells_set = self._net_cells_set[net_idx]
+        if cells_set is None or len(cells_set) <= 1:
             return
-        xs = self._pin_x(owners, self.net_offx[net_idx])
-        ys = self._pin_y(owners, self.net_offy[net_idx])
-        cells = []
-        cells_set = set()
-        for i in range(owners.shape[0]):
-            r, c = self._grid_cell(xs[i], ys[i])
-            cells.append((r, c))
-            cells_set.add((r, c))
-        if len(cells_set) <= 1:
-            return
-        src = cells[0]
+        src = self._net_src[net_idx]
         w = self._net_weight[net_idx]
         if len(cells_set) == 2:
             self._two_pin(src, list(cells_set), w, sign)
         elif len(cells_set) == 3:
             self._three_pin(list(cells_set), w, sign)
         else:
-            for n in cells_set:
-                if n == src:
+            for cell in cells_set:
+                if cell == src:
                     continue
-                self._two_pin(src, [src, n], w, sign)
+                self._two_pin(src, [src, cell], w, sign)
+
+    def _route_pin_cong_recompute(self, net_idx, sign, update_bbox):
+        """Recompute pin cells (and optionally bbox) at current positions, update
+        cache, and apply contribution with `sign`.  Used as the +1 (do) path."""
+        has_m = self.net_has_macros[net_idx]
+        has_p = self.net_has_ports[net_idx]
+        if not has_m and not has_p:
+            self._net_cells_set[net_idx] = None
+            if update_bbox:
+                self._net_xmin[net_idx] = 0.0
+                self._net_xmax[net_idx] = 0.0
+                self._net_ymin[net_idx] = 0.0
+                self._net_ymax[net_idx] = 0.0
+            return
+        cells_set = set()
+        cells_list: List[Tuple[int, int]] = []
+        gc = self.grid_col
+        gr = self.grid_row
+        inv_gw = self._inv_gw
+        inv_gh = self._inv_gh
+        xmin = float("inf")
+        xmax = float("-inf")
+        ymin = float("inf")
+        ymax = float("-inf")
+        if has_m:
+            m_idx = self.net_m_idx[net_idx]
+            m_offx = self.net_m_offx[net_idx]
+            m_offy = self.net_m_offy[net_idx]
+            pos = self.positions
+            n_m = m_idx.shape[0]
+            for k in range(n_m):
+                mi = m_idx[k]
+                cx = pos[mi, 0] + m_offx[k]
+                cy = pos[mi, 1] + m_offy[k]
+                if cx < xmin: xmin = cx
+                if cx > xmax: xmax = cx
+                if cy < ymin: ymin = cy
+                if cy > ymax: ymax = cy
+                c = int(cx * inv_gw)
+                r = int(cy * inv_gh)
+                if c < 0:
+                    c = 0
+                elif c >= gc:
+                    c = gc - 1
+                if r < 0:
+                    r = 0
+                elif r >= gr:
+                    r = gr - 1
+                t = (r, c)
+                cells_list.append(t)
+                cells_set.add(t)
+        if has_p:
+            pxmn = self.net_p_xmin[net_idx]
+            pxmx = self.net_p_xmax[net_idx]
+            pymn = self.net_p_ymin[net_idx]
+            pymx = self.net_p_ymax[net_idx]
+            if pxmn < xmin: xmin = pxmn
+            if pxmx > xmax: xmax = pxmx
+            if pymn < ymin: ymin = pymn
+            if pymx > ymax: ymax = pymx
+            p_r = self.net_p_r[net_idx]
+            p_c = self.net_p_c[net_idx]
+            for k in range(p_r.shape[0]):
+                t = (int(p_r[k]), int(p_c[k]))
+                cells_list.append(t)
+                cells_set.add(t)
+        if update_bbox:
+            self._net_xmin[net_idx] = xmin
+            self._net_xmax[net_idx] = xmax
+            self._net_ymin[net_idx] = ymin
+            self._net_ymax[net_idx] = ymax
+        if len(cells_set) <= 1:
+            self._net_cells_set[net_idx] = cells_set
+            self._net_src[net_idx] = None
+            return
+        if self.net_driver_is_macro[net_idx]:
+            src = cells_list[0]
+        else:
+            n_m_local = self.net_m_idx[net_idx].shape[0]
+            src = cells_list[n_m_local]
+        self._net_cells_set[net_idx] = cells_set
+        self._net_src[net_idx] = src
+        w = self._net_weight[net_idx]
+        if len(cells_set) == 2:
+            self._two_pin(src, list(cells_set), w, sign)
+        elif len(cells_set) == 3:
+            self._three_pin(list(cells_set), w, sign)
+        else:
+            for cell in cells_set:
+                if cell == src:
+                    continue
+                self._two_pin(src, [src, cell], w, sign)
+
+    # Back-compat shim: used only by _init_caches; recomputes + updates bbox.
+    def _route_pin_cong(self, net_idx, sign=+1):
+        self._route_pin_cong_recompute(net_idx, sign, update_bbox=False)
 
     def _two_pin(self, src, two, w, sign):
         sink = two[1] if two[0] == src else two[0]
@@ -441,12 +625,9 @@ class FastEvaluator:
         for m in range(self.n_hard):
             self._add_macro_route(m, +1)
         for n in range(self.n_nets):
-            x0, y0, x1, y1 = self._net_bbox(n)
-            self._net_xmin[n] = x0
-            self._net_ymin[n] = y0
-            self._net_xmax[n] = x1
-            self._net_ymax[n] = y1
-            self._route_pin_cong(n, +1)
+            self._net_cells_set[n] = None
+            self._net_src[n] = None
+            self._route_pin_cong_recompute(n, +1, update_bbox=True)
 
     def _density_cost(self):
         gc = (self.density_grid / self.grid_area).ravel()
@@ -459,9 +640,12 @@ class FastEvaluator:
         cnt = math.floor(N * 0.1)
         if cnt == 0:
             return 0.5 * float(nz.max())
-        sd = np.sort(nz)[::-1]
-        take = min(cnt, sd.size)
-        return 0.5 * float(sd[:take].sum() / cnt)
+        take = min(cnt, nz.size)
+        if take >= nz.size:
+            return 0.5 * float(nz.sum() / cnt)
+        # np.partition is O(n) vs np.sort O(n log n); we only need the top-k sum
+        top_k = np.partition(nz, nz.size - take)[nz.size - take:]
+        return 0.5 * float(top_k.sum() / cnt)
 
     def _smooth(self, grid, axis):
         sr = self.smooth_range
@@ -497,11 +681,12 @@ class FastEvaluator:
         v_s = self._smooth(v, axis=0)
         h_s = self._smooth(h, axis=1)
         combined = np.concatenate([(v_s + vm).ravel(), (h_s + hm).ravel()])
-        xs = np.sort(combined)[::-1]
-        cnt = math.floor(xs.size * 0.05)
+        cnt = math.floor(combined.size * 0.05)
         if cnt == 0:
-            return float(xs.max()) if xs.size else 0.0
-        return float(xs[:cnt].mean())
+            return float(combined.max()) if combined.size else 0.0
+        # np.partition is O(n) vs np.sort O(n log n)
+        top_k = np.partition(combined, combined.size - cnt)[combined.size - cnt:]
+        return float(top_k.mean())
 
     def _wirelength_cost(self):
         hpwl = (self._net_xmax - self._net_xmin) + (self._net_ymax - self._net_ymin)
@@ -524,19 +709,14 @@ class FastEvaluator:
         self._add_macro_density(macro_idx, -1)
         nets = self._owner_to_nets.get(macro_idx, ())
         for n in nets:
-            self._route_pin_cong(n, -1)
+            self._route_pin_cong_apply(n, -1)
         self.positions[macro_idx, 0] = new_x
         self.positions[macro_idx, 1] = new_y
         self._add_macro_density(macro_idx, +1)
         if is_hard:
             self._add_macro_route(macro_idx, +1)
         for n in nets:
-            x0, y0, x1, y1 = self._net_bbox(n)
-            self._net_xmin[n] = x0
-            self._net_ymin[n] = y0
-            self._net_xmax[n] = x1
-            self._net_ymax[n] = y1
-            self._route_pin_cong(n, +1)
+            self._route_pin_cong_recompute(n, +1, update_bbox=True)
 
     def swap_macros(self, i, j):
         xi, yi = self.positions[i]
@@ -678,8 +858,8 @@ def _macro_priority(ev: FastEvaluator) -> List[int]:
 
 
 def _swap_legal(ev: FastEvaluator, i: int, j: int) -> bool:
-    pi = ev.positions[i].copy()
-    pj = ev.positions[j].copy()
+    pi = ev.positions[i]
+    pj = ev.positions[j]
     hi = ev.half[i]
     hj = ev.half[j]
     if pj[0] - hi[0] < 0 or pj[0] + hi[0] > ev.cw:
@@ -690,19 +870,31 @@ def _swap_legal(ev: FastEvaluator, i: int, j: int) -> bool:
         return False
     if pi[1] - hj[1] < 0 or pi[1] + hj[1] > ev.ch:
         return False
-    for k in range(ev.n_hard):
-        if k == i or k == j:
-            continue
-        pk = ev.positions[k]
-        sk = ev.sizes[k]
-        ox = (ev.sizes[i, 0] + sk[0]) / 2 - abs(pj[0] - pk[0])
-        oy = (ev.sizes[i, 1] + sk[1]) / 2 - abs(pj[1] - pk[1])
-        if ox > 0 and oy > 0:
-            return False
-        ox = (ev.sizes[j, 0] + sk[0]) / 2 - abs(pi[0] - pk[0])
-        oy = (ev.sizes[j, 1] + sk[1]) / 2 - abs(pi[1] - pk[1])
-        if ox > 0 and oy > 0:
-            return False
+    n_hard = ev.n_hard
+    pos = ev.positions[:n_hard]
+    sz = ev.sizes[:n_hard]
+    si = ev.sizes[i]
+    sj = ev.sizes[j]
+    # i at pj checks
+    rx_i = (si[0] + sz[:, 0]) * 0.5
+    ry_i = (si[1] + sz[:, 1]) * 0.5
+    ox = rx_i - np.abs(pj[0] - pos[:, 0])
+    oy = ry_i - np.abs(pj[1] - pos[:, 1])
+    ov_i = (ox > 0) & (oy > 0)
+    ov_i[i] = False
+    ov_i[j] = False
+    if ov_i.any():
+        return False
+    # j at pi checks
+    rx_j = (sj[0] + sz[:, 0]) * 0.5
+    ry_j = (sj[1] + sz[:, 1]) * 0.5
+    ox = rx_j - np.abs(pi[0] - pos[:, 0])
+    oy = ry_j - np.abs(pi[1] - pos[:, 1])
+    ov_j = (ox > 0) & (oy > 0)
+    ov_j[i] = False
+    ov_j[j] = False
+    if ov_j.any():
+        return False
     return True
 
 
@@ -712,16 +904,17 @@ def _slide_legal(ev: FastEvaluator, i: int, nx: float, ny: float) -> bool:
         return False
     if ny - half[1] < 0 or ny + half[1] > ev.ch:
         return False
-    for k in range(ev.n_hard):
-        if k == i:
-            continue
-        pk = ev.positions[k]
-        sk = ev.sizes[k]
-        ox = (ev.sizes[i, 0] + sk[0]) / 2 - abs(nx - pk[0])
-        oy = (ev.sizes[i, 1] + sk[1]) / 2 - abs(ny - pk[1])
-        if ox > 0 and oy > 0:
-            return False
-    return True
+    n_hard = ev.n_hard
+    pos = ev.positions[:n_hard]
+    sz = ev.sizes[:n_hard]
+    si = ev.sizes[i]
+    rx = (si[0] + sz[:, 0]) * 0.5
+    ry = (si[1] + sz[:, 1]) * 0.5
+    ox = rx - np.abs(nx - pos[:, 0])
+    oy = ry - np.abs(ny - pos[:, 1])
+    ov = (ox > 0) & (oy > 0)
+    ov[i] = False
+    return not bool(ov.any())
 
 
 def _slide_candidates(ev: FastEvaluator, i: int, n_steps: int = 5, radius_frac: float = 0.08):
@@ -1179,7 +1372,8 @@ def _load_plc(name: str):
     from macro_place.loader import load_benchmark, load_benchmark_from_dir
     root = Path("external/MacroPlacement/Testcases/ICCAD04") / name
     if root.exists():
-        _, plc = load_benchmark_from_dir(str(root))
+        # Upstream PLC client rsplits on '/' only — force forward slashes on Windows.
+        _, plc = load_benchmark_from_dir(root.as_posix())
         return plc
     ng45 = {
         "ariane133": "ariane133", "ariane136": "ariane136",
@@ -1221,6 +1415,13 @@ class LKPlacer:
         lahc_list_len: int = 100,
         verbose: bool = True,
     ):
+        import os
+        env_budget = os.environ.get("LK_TIME_BUDGET_S")
+        if env_budget:
+            try:
+                time_budget_s = float(env_budget)
+            except ValueError:
+                pass
         self.seed = seed
         self.time_budget_s = time_budget_s
         self.run_gp = run_gp
