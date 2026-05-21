@@ -949,6 +949,23 @@ def _build_population_seeds(
     return pop
 
 
+def _reset_adam_for_losers(opt, pop, losers, n_hard):
+    """Zero Adam moments for soft slots of the given candidate indices.
+
+    Without this, PBT respawns inherit stale momentum from the loser's prior
+    trajectory and drift toward wrong basins. `step` counter is left alone
+    since it's a scalar shared across the whole tensor.
+    """
+    if not losers:
+        return
+    state = opt.state.get(pop, None)
+    if not state or 'exp_avg' not in state:
+        return
+    idx = torch.as_tensor(list(losers), device=pop.device, dtype=torch.long)
+    state['exp_avg'][idx, n_hard:].zero_()
+    state['exp_avg_sq'][idx, n_hard:].zero_()
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Main placer
 # ────────────────────────────────────────────────────────────────────────────
@@ -1033,7 +1050,19 @@ class GraphGradPlacer:
         return best_across
 
     def _soft_only_single_run(self, benchmark: Benchmark, run_seed: int):
-        """One soft-only optimization run.  Returns (placement_tensor, true_proxy)."""
+        """One soft-only optimization run with hard-release final phase.
+
+        Phase A (steps [0, release_step)): Hard macros locked at legalized
+        initial.plc.  96-way Adam on soft positions only (anchor + 0.1 jitter).
+
+        Phase B (steps [release_step, n_steps)): Hard macros unlocked, added
+        to the loss with a strong anchor-pull regularizer and a heavy
+        differentiable overlap penalty.  Periodic _legalize sweeps every 200
+        steps keep accumulated overlap small.  Final _legalize always runs
+        before scoring.
+
+        Returns (placement_tensor, true_proxy).
+        """
         from macro_place.objective import compute_proxy_cost
 
         t_start = time.time()
@@ -1047,6 +1076,7 @@ class GraphGradPlacer:
         cw = float(benchmark.canvas_width)
         ch = float(benchmark.canvas_height)
         sizes_all = benchmark.macro_sizes.to(device).float()
+        sizes_hard_t = sizes_all[:n_hard]
         sizes_np = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
         movable_np = benchmark.get_movable_mask()[:n_hard].numpy()
         owner_idx, pin_off, net_id, n_nets = _build_pin_tensors(benchmark, device)
@@ -1063,20 +1093,33 @@ class GraphGradPlacer:
         hard_legal = _legalize(init_pos, sizes_np, movable_np, cw, ch, gap=0.005)
         hard_legal_t = torch.tensor(hard_legal, device=device, dtype=torch.float32)
         soft_anchor = benchmark.macro_positions[n_hard:].to(device).float()
+        n_soft = n_macros - n_hard
+
         self._log(
-            f"soft-only setup: n_hard={n_hard} n_soft={n_macros - n_hard} "
+            f"soft-only setup: n_hard={n_hard} n_soft={n_soft} "
             f"n_nets={n_nets}  grid {grid_col}x{grid_row}  H/V {h_per_um:.2f}/{v_per_um:.2f}  "
             f"device={device}"
         )
 
-        # Population: every seed shares the same locked hard layout;
-        # soft starts at initial soft + small jitter.
+        # Population: all 96 candidates share the locked hard layout; soft
+        # starts at initial soft + small jitter (proven baseline).
         K = self.pop_size
         pop = torch.zeros(K, n_macros, 2, device=device, dtype=torch.float32)
         pop[:, :n_hard] = hard_legal_t
-        pop[:, n_hard:] = soft_anchor + torch.randn(K, n_macros - n_hard, 2, device=device) * 0.1
+        pop[:, n_hard:] = soft_anchor + torch.randn(K, n_soft, 2, device=device) * 0.1
         pop.requires_grad_(True)
         opt = torch.optim.Adam([pop], lr=self.soft_lr)
+
+        # Joint-release config: unlock hard for last 20% of training.
+        # Hard gets pulled toward initial.plc by normalized anchor regularizer,
+        # plus a heavy differentiable overlap penalty.  Periodic _legalize keeps
+        # overlap from accumulating.
+        release_step = int(0.80 * self.soft_steps)
+        canvas_norm_t = torch.tensor([cw, ch], device=device, dtype=torch.float32).view(1, 1, 2)
+        hard_anchor_b = hard_legal_t.unsqueeze(0)  # [1, n_hard, 2] broadcasts on K
+        alpha_anchor = 50.0   # normalized squared drift × 50; drift ~10% canvas → ~0.5 loss
+        alpha_ov = 1000.0     # normalized overlap-area × 1000
+        relegalize_every = 200
 
         n_steps = self.soft_steps
         for step in range(n_steps):
@@ -1093,22 +1136,51 @@ class GraphGradPlacer:
                 n_hard, n_macros, grid_col, grid_row, cw, ch,
                 h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
             )
-            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong  # mirrors compute_proxy_cost
-            loss = proxy_surr.sum()
+            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong  # mirrors compute_proxy_cost, [K]
+            in_joint = step >= release_step
+            if in_joint:
+                hard_diff_n = (pop[:, :n_hard] - hard_anchor_b) / canvas_norm_t
+                anchor_pen = hard_diff_n.pow(2).mean(dim=(1, 2))  # [K]
+                ov_pen = overlap_loss_hard(pop[:, :n_hard], sizes_hard_t) / (cw * ch)  # [K]
+                loss = (proxy_surr + alpha_anchor * anchor_pen + alpha_ov * ov_pen).sum()
+            else:
+                loss = proxy_surr.sum()
             loss.backward()
             with torch.no_grad():
-                pop.grad[:, :n_hard].zero_()  # LOCK hard macros
+                if not in_joint:
+                    pop.grad[:, :n_hard].zero_()  # LOCK hard macros (Phase A)
             opt.step()
             with torch.no_grad():
+                # Always clamp softs to canvas
                 pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
-                pop[:, :n_hard] = hard_legal_t  # reassert lock
+                if not in_joint:
+                    pop[:, :n_hard] = hard_legal_t  # reassert lock
+                else:
+                    # Clamp hard to canvas during joint phase
+                    pop[:, :n_hard, 0].clamp_(min=half_w_t[:n_hard], max=cw - half_w_t[:n_hard])
+                    pop[:, :n_hard, 1].clamp_(min=half_h_t[:n_hard], max=ch - half_h_t[:n_hard])
+                    # Periodic re-legalize during joint phase to prevent overlap accumulation
+                    rel_step = step - release_step
+                    if rel_step > 0 and rel_step % relegalize_every == 0:
+                        pop_cpu = pop[:, :n_hard].detach().cpu().numpy().astype(np.float64)
+                        for k in range(K):
+                            pop_cpu[k] = _legalize(pop_cpu[k], sizes_np, movable_np, cw, ch, gap=0.005)
+                        pop.data[:, :n_hard] = torch.tensor(pop_cpu, device=device, dtype=torch.float32)
             if self.verbose and step % max(n_steps // 6, 1) == 0:
+                tag = "JOINT" if in_joint else "soft"
                 self._log(
-                    f"  step {step}: wl_n={wl_n.mean().item():.4f} "
+                    f"  step {step} [{tag}]: wl_n={wl_n.mean().item():.4f} "
                     f"dens={dens.mean().item():.4f} cong={cong.mean().item():.4f} "
                     f"proxy_surr={proxy_surr.mean().item():.4f}"
                 )
+
+        # Final re-legalize for all candidates (guarantees zero hard overlap).
+        with torch.no_grad():
+            pop_cpu = pop[:, :n_hard].detach().cpu().numpy().astype(np.float64)
+            for k in range(K):
+                pop_cpu[k] = _legalize(pop_cpu[k], sizes_np, movable_np, cw, ch, gap=0.005)
+            pop.data[:, :n_hard] = torch.tensor(pop_cpu, device=device, dtype=torch.float32)
 
         # Rank candidates by surrogate; evaluate top-K' by TRUE proxy.
         with torch.no_grad():
@@ -1129,6 +1201,7 @@ class GraphGradPlacer:
         # Cache plc once — each _load_plc reparses the netlist (~seconds)
         plc = _load_plc(benchmark.name)
         best_full, best_cost = None, float("inf")
+        true_costs: List[float] = []
         for k in top_idx:
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
             pos_full = self._clip_soft_to_canvas(pos_full, benchmark, n_hard, cw, ch)
@@ -1136,9 +1209,17 @@ class GraphGradPlacer:
             if plc is None:
                 continue
             c = compute_proxy_cost(full_t, benchmark, plc)
-            if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
-                best_cost = c["proxy_cost"]
-                best_full = full_t
+            if c["overlap_count"] == 0:
+                true_costs.append(float(c["proxy_cost"]))
+                if c["proxy_cost"] < best_cost:
+                    best_cost = c["proxy_cost"]
+                    best_full = full_t
+        if true_costs:
+            print(
+                f"[koral release] top_idx true-cost min={min(true_costs):.4f} "
+                f"max={max(true_costs):.4f} span={max(true_costs)-min(true_costs):.4f} n={len(true_costs)}",
+                flush=True,
+            )
         # Anchor safety net
         full_anc = torch.zeros(n_macros, 2)
         full_anc[:n_hard] = hard_legal_t.cpu()
