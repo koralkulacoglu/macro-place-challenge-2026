@@ -454,7 +454,7 @@ def electrostatic_density_loss(
 
     1. Bilinear-spread density map calculation.
     2. Solve Poisson equation via 2D-DCT.
-    3. Sum squared potential (Electrostatic Energy).
+    3. Mean squared potential (Electrostatic Energy).
 
     Provides long-range spreading forces that grid-based local density lacks.
     """
@@ -466,7 +466,7 @@ def electrostatic_density_loss(
     cell_h = ch / grid_res
     cell_area = cell_w * cell_h
 
-    # Differentiable bilinear spreading (same logic as tilos but fixed res)
+    # Differentiable bilinear spreading
     cell_idx = torch.arange(grid_res, device=device, dtype=dtype)
     cl, cr = cell_idx * cell_w, (cell_idx + 1) * cell_w
     cb, ct = cell_idx * cell_h, (cell_idx + 1) * cell_h
@@ -483,10 +483,8 @@ def electrostatic_density_loss(
     rho_hat = _dct2d(rho)
 
     # Poisson kernel in frequency domain: 1 / (wu^2 + wv^2)
-    # Standard finite-difference Laplacian eigenvalues for DCT
     u = torch.arange(grid_res, device=device, dtype=dtype)
     v = torch.arange(grid_res, device=device, dtype=dtype)
-    # Using exact DCT eigenvalues for the Laplacian
     wu = 2.0 - 2.0 * torch.cos(math.pi * u / grid_res)
     wv = 2.0 - 2.0 * torch.cos(math.pi * v / grid_res)
     denom = wu.view(1, -1) + wv.view(-1, 1)
@@ -494,10 +492,11 @@ def electrostatic_density_loss(
 
     # Potential hat: solve Grad^2 phi = rho - mean(rho)
     phi_hat = rho_hat / denom
-    phi_hat[:, 0, 0] = 0.0  # Zero out DC component (mean subtraction)
+    phi_hat[:, 0, 0] = 0.0  # Zero out DC component
 
-    # Electrostatic energy = sum(rho_hat * phi_hat)
-    energy = (rho_hat * phi_hat).sum(dim=(1, 2))
+    # Electrostatic energy = mean(rho_hat * phi_hat)
+    # Using .mean() instead of .sum() matches the scale of TILOS density/congestion terms
+    energy = (rho_hat * phi_hat).mean(dim=(1, 2))
     return energy
 
 
@@ -1054,7 +1053,7 @@ class GraphGradPlacer:
         soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
         n_restarts: int = 1,               # Independent restarts with different RNG seeds
-        electro_w: float = 0.5,            # Weight of Poisson electrostatic density
+        electro_w: float = 0.01,           # Weight of Poisson electrostatic density
     ):
         self.seed = seed
         self.pop_size = pop_size
