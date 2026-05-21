@@ -447,7 +447,7 @@ def electrostatic_density_loss(
     sizes: torch.Tensor,
     cw: float,
     ch: float,
-    grid_res: int = 32,
+    grid_res: int = 128,
 ) -> torch.Tensor:
     """
     Poisson-style electrostatic density loss (ePlace/DREAMPlace style).
@@ -455,8 +455,6 @@ def electrostatic_density_loss(
     1. Bilinear-spread density map calculation.
     2. Solve Poisson equation via 2D-DCT.
     3. Mean squared potential (Electrostatic Energy).
-
-    Provides long-range spreading forces that grid-based local density lacks.
     """
     K, N, _ = pop.shape
     device = pop.device
@@ -479,23 +477,24 @@ def electrostatic_density_loss(
     y_ov = (torch.min(mt, ct) - torch.max(mb, cb)).clamp(min=0.0)
     rho = torch.einsum("knx,kny->kyx", x_ov, y_ov) / cell_area  # [K, Gy, Gx]
 
+    # Subtract mean (neutrality)
+    rho = rho - rho.mean(dim=(1, 2), keepdim=True)
+
     # 2D-DCT
     rho_hat = _dct2d(rho)
 
-    # Poisson kernel in frequency domain: 1 / (wu^2 + wv^2)
+    # Poisson kernel
     u = torch.arange(grid_res, device=device, dtype=dtype)
     v = torch.arange(grid_res, device=device, dtype=dtype)
     wu = 2.0 - 2.0 * torch.cos(math.pi * u / grid_res)
     wv = 2.0 - 2.0 * torch.cos(math.pi * v / grid_res)
     denom = wu.view(1, -1) + wv.view(-1, 1)
-    denom[0, 0] = 1.0  # DC component handled below
+    denom[0, 0] = 1.0
 
-    # Potential hat: solve Grad^2 phi = rho - mean(rho)
     phi_hat = rho_hat / denom
-    phi_hat[:, 0, 0] = 0.0  # Zero out DC component
+    phi_hat[:, 0, 0] = 0.0
 
-    # Electrostatic energy = mean(rho_hat * phi_hat)
-    # Using .mean() instead of .sum() matches the scale of TILOS density/congestion terms
+    # Energy = mean(rho * phi)
     energy = (rho_hat * phi_hat).mean(dim=(1, 2))
     return energy
 
@@ -1020,12 +1019,15 @@ def _build_population_seeds(
         pop[k, n_hard:, 0] = cw / 2 + rng.normal(0, cw * 0.25, n_macros - n_hard)
         pop[k, n_hard:, 1] = ch / 2 + rng.normal(0, ch * 0.25, n_macros - n_hard)
         used = k + 1
-    # Remaining: jittered initial.plc at varying scales (FAST, no legalization)
+    # Remaining: jittered initial.plc at varying scales
     for k in range(used, K):
         scale = 0.02 + 0.10 * rng.random()
         jitter = rng.standard_normal((n_hard, 2)) * (min(cw, ch) * scale)
         jitter[~movable_np] = 0.0
-        pop[k, :n_hard] = init_hard + jitter
+        pos_h = init_hard + jitter
+        # Use fast vectorized legalization for jittered seeds
+        pos_h_leg = _legalize(pos_h, sizes_np, movable_np, cw, ch, gap=0.01)
+        pop[k, :n_hard] = pos_h_leg
         soft_jit = rng.standard_normal((n_macros - n_hard, 2)) * (
             min(cw, ch) * scale * 0.5
         )
@@ -1439,6 +1441,13 @@ class GraphGradPlacer:
                     + cur_electro_w * electro
                 ).sum()
                 loss.backward()
+
+                if step % 100 == 0:
+                    self._log(
+                        f"  step {step:4d}: WL={wl_n.mean():.4f} Dens={dens.mean():.4f} "
+                        f"Cong={cong.mean():.4f} Electro={electro.mean():.4f} "
+                        f"OV={ov.mean():.4f}"
+                    )
 
                 opt.step()
                 with torch.no_grad():
