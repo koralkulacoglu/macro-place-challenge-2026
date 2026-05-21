@@ -447,7 +447,7 @@ def electrostatic_density_loss(
     sizes: torch.Tensor,
     cw: float,
     ch: float,
-    grid_res: int = 64,
+    grid_res: int = 32,
 ) -> torch.Tensor:
     """
     Poisson-style electrostatic density loss (ePlace/DREAMPlace style).
@@ -992,10 +992,10 @@ def _build_population_seeds(
         return pop
 
     # Budget seed slots: roughly 1/8 spectral, 1/4 FD-random, rest jittered.
-    # Always clamp to fit in [1, K-1].
-    n_spec = max(1, K // 8) if K >= 8 else 0
-    n_fd = max(1, K // 4) if K >= 4 else 0
-    # If small K, fall back to just jittered anchor (cheapest, safest)
+    # Limit heavy CPU legalization to top 4 seeds to avoid hangs
+    n_spec = min(2, max(1, K // 8) if K >= 8 else 0)
+    n_fd = min(2, max(1, K // 4) if K >= 4 else 0)
+
     used = 1
     # Seeds 1..n_spec: spectral with random rotations
     for k in range(1, 1 + n_spec):
@@ -1012,21 +1012,23 @@ def _build_population_seeds(
         if k >= K:
             break
         iters_ = rng.integers(40, 160)
-        fd = _force_directed_init(edges, weights, n_hard, cw, ch, iters=int(iters_), seed=seed + k * 7)
+        fd = _force_directed_init(
+            edges, weights, n_hard, cw, ch, iters=int(iters_), seed=seed + k * 7
+        )
         fd_leg = _legalize(fd, sizes_np, movable_np, cw, ch, gap=0.005)
         pop[k, :n_hard] = fd_leg
         pop[k, n_hard:, 0] = cw / 2 + rng.normal(0, cw * 0.25, n_macros - n_hard)
         pop[k, n_hard:, 1] = ch / 2 + rng.normal(0, ch * 0.25, n_macros - n_hard)
         used = k + 1
-    # Remaining: jittered initial.plc at varying scales
+    # Remaining: jittered initial.plc at varying scales (FAST, no legalization)
     for k in range(used, K):
         scale = 0.02 + 0.10 * rng.random()
         jitter = rng.standard_normal((n_hard, 2)) * (min(cw, ch) * scale)
         jitter[~movable_np] = 0.0
-        pos_h = init_hard + jitter
-        pos_h_leg = _legalize(pos_h, sizes_np, movable_np, cw, ch, gap=0.005)
-        pop[k, :n_hard] = pos_h_leg
-        soft_jit = rng.standard_normal((n_macros - n_hard, 2)) * (min(cw, ch) * scale * 0.5)
+        pop[k, :n_hard] = init_hard + jitter
+        soft_jit = rng.standard_normal((n_macros - n_hard, 2)) * (
+            min(cw, ch) * scale * 0.5
+        )
         pop[k, n_hard:] = init_soft + soft_jit
 
     return pop
@@ -1049,11 +1051,11 @@ class GraphGradPlacer:
         grid_res: int = 32,
         time_budget_s: float = 3000.0,     # 50 min
         verbose: bool = False,
-        lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
+        lock_hard: bool = False,            # Lock hard macros at legalized initial.plc
         soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
         n_restarts: int = 1,               # Independent restarts with different RNG seeds
-        electro_w: float = 0.01,           # Weight of Poisson electrostatic density
+        electro_w: float = 0.005,          # Weight of Poisson electrostatic density
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -1069,7 +1071,7 @@ class GraphGradPlacer:
         self.electro_w = electro_w
 
     def _log(self, msg: str):
-        if self.verbose:
+        if self.verbose or True:  # Always log phase transitions for visibility
             print(f"[graph_grad] {msg}", flush=True)
 
     def _true_cost(self, plc, full: torch.Tensor, benchmark: Benchmark) -> float:
@@ -1222,18 +1224,45 @@ class GraphGradPlacer:
         # Rank candidates by surrogate; evaluate top-K' by TRUE proxy.
         with torch.no_grad():
             wl_n = tilos_wl_normalized(
-                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, 0.05, cw, ch,
+                pop,
+                owner_idx,
+                pin_off,
+                net_id,
+                n_nets,
+                port_pos,
+                n_hard,
+                n_macros,
+                0.05,
+                cw,
+                ch,
             )
             dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
             cong = tilos_rudy_normalized(
-                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, grid_col, grid_row, cw, ch,
-                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+                pop,
+                owner_idx,
+                pin_off,
+                net_id,
+                n_nets,
+                port_pos,
+                n_hard,
+                n_macros,
+                grid_col,
+                grid_row,
+                cw,
+                ch,
+                h_per_um,
+                v_per_um,
+                smooth_range=2,
+                k_frac=0.05,
             )
             surr = wl_n + 0.5 * dens + 0.5 * cong
-        k_eval = min(K, max(8, K // 2))
+        
+        # Release GPU memory before slow oracle calls
+        torch.cuda.empty_cache()
+        
+        k_eval = min(K, 8)  # Reduced from K//2 to 8 for faster cleanup
         top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
+        self._log(f"final selection: evaluating top {k_eval} candidates via slow oracle...")
 
         # Cache plc once — each _load_plc reparses the netlist (~seconds)
         plc = _load_plc(benchmark.name)
@@ -1463,14 +1492,27 @@ class GraphGradPlacer:
         if plc is not None:
             with torch.no_grad():
                 wl_eval = wahpwl(
-                    pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                    n_hard, n_macros, 0.1,
+                    pop,
+                    owner_idx,
+                    pin_off,
+                    net_id,
+                    n_nets,
+                    port_pos,
+                    n_hard,
+                    n_macros,
+                    0.1,
                 )
                 ov_eval = overlap_loss_hard(pop[:, :n_hard], sizes_hard)
                 surr = wl_eval + 100.0 * ov_eval
-            k_final = min(K, max(8, K // 2))
+
+            # Release GPU memory before slow oracle calls
+            torch.cuda.empty_cache()
+
+            k_final = min(K, 8)  # Reduced from K//2 to 8 for faster cleanup
             top_idx = torch.topk(-surr, k=k_final).indices.tolist()
-            self._log(f"final sweep over top {k_final} of {K} candidates")
+            self._log(
+                f"final selection: evaluating top {k_final} candidates via slow oracle..."
+            )
             for k in top_idx:
                 if time.time() - t_start > self.time_budget_s:
                     self._log("budget out; stopping final sweep")
