@@ -417,6 +417,90 @@ def _lse_max_per_net(
     return gamma * torch.log(sum_exp.clamp(min=1e-12)) + max_pn
 
 
+def _dct1d(x: torch.Tensor, norm: str = "ortho") -> torch.Tensor:
+    """1D Discrete Cosine Transform (DCT-II) via FFT."""
+    try:
+        return torch.fft.dct(x, norm=norm)
+    except AttributeError:
+        # Fallback for older torch versions if needed
+        N = x.shape[-1]
+        x_m = torch.cat([x[..., ::2], x[..., 1::2].flip([-1])], dim=-1)
+        X_f = torch.fft.fft(x_m, dim=-1)
+        k = -torch.arange(N, device=x.device, dtype=x.dtype) * math.pi / (2 * N)
+        W = torch.exp(1j * k)
+        result = 2 * (X_f * W).real
+        if norm == "ortho":
+            result[..., 0] *= 1 / math.sqrt(4 * N)
+            result[..., 1:] *= 1 / math.sqrt(2 * N)
+        return result
+
+
+def _dct2d(x: torch.Tensor) -> torch.Tensor:
+    """2D Discrete Cosine Transform via 1D DCTs."""
+    return _dct1d(_dct1d(x, norm="ortho").transpose(-1, -2), norm="ortho").transpose(
+        -1, -2
+    )
+
+
+def electrostatic_density_loss(
+    pop: torch.Tensor,
+    sizes: torch.Tensor,
+    cw: float,
+    ch: float,
+    grid_res: int = 64,
+) -> torch.Tensor:
+    """
+    Poisson-style electrostatic density loss (ePlace/DREAMPlace style).
+
+    1. Bilinear-spread density map calculation.
+    2. Solve Poisson equation via 2D-DCT.
+    3. Sum squared potential (Electrostatic Energy).
+
+    Provides long-range spreading forces that grid-based local density lacks.
+    """
+    K, N, _ = pop.shape
+    device = pop.device
+    dtype = pop.dtype
+
+    cell_w = cw / grid_res
+    cell_h = ch / grid_res
+    cell_area = cell_w * cell_h
+
+    # Differentiable bilinear spreading (same logic as tilos but fixed res)
+    cell_idx = torch.arange(grid_res, device=device, dtype=dtype)
+    cl, cr = cell_idx * cell_w, (cell_idx + 1) * cell_w
+    cb, ct = cell_idx * cell_h, (cell_idx + 1) * cell_h
+
+    hw, hh = sizes[:, 0] / 2, sizes[:, 1] / 2
+    ml, mr = (pop[..., 0] - hw).unsqueeze(-1), (pop[..., 0] + hw).unsqueeze(-1)
+    mb, mt = (pop[..., 1] - hh).unsqueeze(-1), (pop[..., 1] + hh).unsqueeze(-1)
+
+    x_ov = (torch.min(mr, cr) - torch.max(ml, cl)).clamp(min=0.0)
+    y_ov = (torch.min(mt, ct) - torch.max(mb, cb)).clamp(min=0.0)
+    rho = torch.einsum("knx,kny->kyx", x_ov, y_ov) / cell_area  # [K, Gy, Gx]
+
+    # 2D-DCT
+    rho_hat = _dct2d(rho)
+
+    # Poisson kernel in frequency domain: 1 / (wu^2 + wv^2)
+    # Standard finite-difference Laplacian eigenvalues for DCT
+    u = torch.arange(grid_res, device=device, dtype=dtype)
+    v = torch.arange(grid_res, device=device, dtype=dtype)
+    # Using exact DCT eigenvalues for the Laplacian
+    wu = 2.0 - 2.0 * torch.cos(math.pi * u / grid_res)
+    wv = 2.0 - 2.0 * torch.cos(math.pi * v / grid_res)
+    denom = wu.view(1, -1) + wv.view(-1, 1)
+    denom[0, 0] = 1.0  # DC component handled below
+
+    # Potential hat: solve Grad^2 phi = rho - mean(rho)
+    phi_hat = rho_hat / denom
+    phi_hat[:, 0, 0] = 0.0  # Zero out DC component (mean subtraction)
+
+    # Electrostatic energy = sum(rho_hat * phi_hat)
+    energy = (rho_hat * phi_hat).sum(dim=(1, 2))
+    return energy
+
+
 def wahpwl(
     pop: torch.Tensor,
     owner_idx: torch.Tensor,
@@ -970,6 +1054,7 @@ class GraphGradPlacer:
         soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
         n_restarts: int = 1,               # Independent restarts with different RNG seeds
+        electro_w: float = 0.5,            # Weight of Poisson electrostatic density
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -982,6 +1067,7 @@ class GraphGradPlacer:
         self.soft_steps = soft_steps
         self.soft_lr = soft_lr
         self.n_restarts = n_restarts
+        self.electro_w = electro_w
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1082,19 +1168,43 @@ class GraphGradPlacer:
         for step in range(n_steps):
             opt.zero_grad()
             progress = step / max(n_steps, 1)
-            gamma = 1.0 * (0.05 ** progress)  # WAHPWL smoothing → sharp Manhattan HPWL
+            gamma = 1.0 * (0.05**progress)  # WAHPWL smoothing → sharp Manhattan HPWL
             wl_n = tilos_wl_normalized(
-                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, gamma, cw, ch,
+                pop,
+                owner_idx,
+                pin_off,
+                net_id,
+                n_nets,
+                port_pos,
+                n_hard,
+                n_macros,
+                gamma,
+                cw,
+                ch,
             )
             dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
             cong = tilos_rudy_normalized(
-                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, grid_col, grid_row, cw, ch,
-                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+                pop,
+                owner_idx,
+                pin_off,
+                net_id,
+                n_nets,
+                port_pos,
+                n_hard,
+                n_macros,
+                grid_col,
+                grid_row,
+                cw,
+                ch,
+                h_per_um,
+                v_per_um,
+                smooth_range=2,
+                k_frac=0.05,
             )
-            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong  # mirrors compute_proxy_cost
-            loss = proxy_surr.sum()
+            # Electrostatic global spreading alongside local density
+            electro = electrostatic_density_loss(pop, sizes_all, cw, ch, grid_res=64)
+            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong
+            loss = (proxy_surr + self.electro_w * electro).sum()
             loss.backward()
             with torch.no_grad():
                 pop.grad[:, :n_hard].zero_()  # LOCK hard macros
@@ -1245,6 +1355,7 @@ class GraphGradPlacer:
 
             for step in range(self.steps_per_epoch):
                 opt.zero_grad()
+
                 # The TILOS-faithful proxy surrogate:
                 #   proxy_surrogate = wl_norm + 0.5 * tilos_density + 0.5 * tilos_rudy
                 # WL is normalized exactly like get_cost() (raw_HPWL / ((cw+ch)*n_nets)).
@@ -1252,21 +1363,55 @@ class GraphGradPlacer:
                 # Congestion is the differentiable RUDY approximation with TILOS's
                 # H/V track normalization and 1-D smoothing kernel.
                 wl_n = tilos_wl_normalized(
-                    pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                    n_hard, n_macros, gamma, cw, ch,
+                    pop,
+                    owner_idx,
+                    pin_off,
+                    net_id,
+                    n_nets,
+                    port_pos,
+                    n_hard,
+                    n_macros,
+                    gamma,
+                    cw,
+                    ch,
                 )
                 dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
                 cong = tilos_rudy_normalized(
-                    pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                    n_hard, n_macros, grid_col, grid_row, cw, ch,
-                    h_per_um, v_per_um, smooth_range=smooth_rng, k_frac=0.05,
+                    pop,
+                    owner_idx,
+                    pin_off,
+                    net_id,
+                    n_nets,
+                    port_pos,
+                    n_hard,
+                    n_macros,
+                    grid_col,
+                    grid_row,
+                    cw,
+                    ch,
+                    h_per_um,
+                    v_per_um,
+                    smooth_range=smooth_rng,
+                    k_frac=0.05,
                 )
                 ov = overlap_loss_hard(pop[:, :n_hard], sizes_hard)
                 anch = anchor_reg(pop, anchor_pos_t, anchor_mask)
+
+                # Poisson electrostatic energy (global spreading)
+                # Anneal the weight: starts higher for global structure, fades for legalization
+                cur_electro_w = self.electro_w * (0.5**progress)
+                electro = electrostatic_density_loss(pop, sizes_all, cw, ch, grid_res=64)
+
                 # proxy surrogate (mirrors compute_proxy_cost weights exactly)
                 proxy_surr = wl_n + 0.5 * dens + 0.5 * cong
-                loss = (proxy_surr + alpha_ov * ov + alpha_anchor * anch).sum()
+                loss = (
+                    proxy_surr
+                    + alpha_ov * ov
+                    + alpha_anchor * anch
+                    + cur_electro_w * electro
+                ).sum()
                 loss.backward()
+
                 opt.step()
                 with torch.no_grad():
                     pop[..., 0].clamp_(min=half_w_t.unsqueeze(0), max=(cw - half_w_t).unsqueeze(0))
