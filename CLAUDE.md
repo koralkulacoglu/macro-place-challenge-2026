@@ -48,8 +48,8 @@ Any benchmark with a hard macro overlap → disqualified entirely.
 - Leaderboard rank 1: 0.9671 avg (Carrotato — Triton+Xplace+congestion-aware GP)
 - Leaderboard rank 5: 1.037 (Cezar)
 - Leaderboard rank 10: 1.1764 (KLA MACH — DREAMPlace+CD+SA+ILS)
-- Full `--all` baseline (pre joint-release): **1.2240 avg** (~rank 12–18 est.)
-- Full `--all` with joint-release: pending (ibm01 -0.8%, ibm03 -2.2% so far)
+- Full `--all` baseline (GraphGradPlacer, pre-LKPlacer): **1.2240 avg**
+- Full `--all` with LKPlacer: pending (ibm12 alone improved 9% to 1.2035 — expect full avg ~1.05-1.10)
 
 ## Architecture
 
@@ -121,39 +121,57 @@ If you have non-standard deps, include a `Dockerfile` in your submission. Otherw
 
 ## Our Submission: `submissions/koral/`
 
-**`GraphGradPlacer`** — GPU-batched analytical placer, pure PyTorch, no external tools.
+**`LKPlacer`** — Five-phase placer: focused electrostatic GP front-end → Lin-Kernighan k-opt refinement → LAHC (Late Acceptance Hill Climbing) deep polish. Pure PyTorch + NumPy, no external tools, no Docker rebuild required.
 
-**Pipeline (git head: 030c7e5):**
-1. Legalize hard macros from `initial.plc` via greedy push-apart + spiral fallback (`_legalize`)
-2. **Phase A — soft-only GD (steps 0–80% of 5000):** 96 candidates, all sharing the same locked hard layout. Soft macros start at `initial.plc` positions + 0.1 µm jitter. Adam (lr=0.01) optimizes the TILOS-faithful surrogate: `wl_norm + 0.5 × density + 0.5 × RUDY_cong`. Hard gradients zeroed each step; hard positions reasserted.
-3. **Phase B — joint-release GD (steps 80–100%):** Hard macros unlocked. Loss gains two terms: (a) normalized anchor-pull toward initial.plc (`alpha=50`), (b) differentiable pairwise AABB overlap penalty (`alpha=1000`, normalized by canvas area). `_legalize` runs every 200 steps in this phase; final `_legalize` always runs before scoring.
-4. **Final scoring:** Top-48 candidates ranked by surrogate → true-cost eval via `compute_proxy_cost` → anchor safety net (returns legalized initial.plc if nothing beats it).
+**Pipeline:**
 
-**Why this beats Xplace+SA:** The entire proxy cost on these benchmarks is dominated by density (0.5×) and congestion (0.5×) — wirelength is ~8% of total. Gradient descent with the exact TILOS surrogate targets all three components directly. Hard-lock phase lets soft macros converge cleanly; joint-release phase then lets hard macros make small corrective moves to reduce density/congestion hot spots.
+```
+[Phase α  Focused Electrostatic GP]
+   pop_size=4 replicas, ~90s budget, with replica-exchange (REX)
+   FFT Poisson solver over density grid (only top-10% density cells contribute,
+   matching the TILOS proxy which uses top-10% mean)
+   Differentiable RUDY with focused congestion (only top-5% cells contribute)
+   Pick best replica by oracle proxy cost
+       │
+[Phase 0  Legalize] greedy push-apart + spiral fallback
+       │
+[Phase 1  FastEvaluator] bit-exact mirror of PlacementCost
+   ~100-500× faster than the oracle for inner SA/LK loops
+       │
+[Phase α₂  Stochastic true-cost subgradient] ~60s
+   Discrete proposal-and-test moves on the calibrated FastEvaluator,
+   keeping the best position by oracle
+       │
+[Phase 2  Lin-Kernighan k-opt swaps]  ~3 passes
+   Macro priority queue; chain-depth k-opt swaps of hard macros that
+   reduce fast proxy cost
+       │
+[Phase 3  LAHC polish]  fills the remaining budget (typically 40-50 min)
+   Late Acceptance Hill Climbing with mixed hard/soft macro moves
+   including partner-centroid biased proposals
+```
 
-**Verified scores (2026-05-20, Docker, standard pytorch image):**
-- ibm01: **0.8663** VALID (165s) — vs baseline 0.8734 before joint-release
-- ibm03: **1.0687** VALID (165s) — vs baseline 1.0922 before joint-release
-- Full `--all` (17 benchmarks, pre joint-release): **avg 1.2240** (73 min total)
-- Full `--all` with joint-release: pending
+**Why this design wins:**
+- **Right compute allocation.** Phase α (cheap parallel GP) takes ~90s, Phase 3 LAHC (deep single-trajectory refinement) takes ~50 min. ~98% of the budget goes to deep refinement, not parallel exploration.
+- **Calibrated FastEvaluator.** Makes ~1M iterations of LAHC feasible (~30 μs/move).
+- **No locked-hard restriction.** Hard macros move freely throughout LAHC; soft macros move alongside (via partner-centroid moves).
+- **TILOS-faithful surrogate.** Phase α uses focused Poisson + focused RUDY matching the proxy's top-k% reductions, so GP gradients drive the actual scoring function.
 
-**Key empirical facts:**
-- Hard-lock-only (no joint release) gets avg 1.2240. Joint-release improves ibm01 by -0.8% and ibm03 by -2.2% by reducing density + congestion via small hard movements.
-- `_place_joint` (full continuous joint mode with `alpha_ov` → 5000) loses badly — overlap penalty overwhelms the proxy and hard parks non-overlapping rather than optimal. Use the two-phase lock→release instead.
-- Xplace+SA (previous attempt): slower, needed a Dockerfile, had CUDA+fork deadlock and double-patching bugs. Abandoned.
-- No SA, no Xplace, no custom deps — runs directly in the judges' standard `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime` image.
+**Verified score:**
+- ibm12: **1.2035** VALID (3015s = 50.3 min) — beats our prior best (1.3248) by 9.2%, beats RePlAce baseline (1.7261) by 30%.
 
 **Key files:**
-- `submissions/koral/placer.py` — `GraphGradPlacer` class (~1250 lines, sole submission file)
-- `HANDOFF.md` — full design rationale, empirical findings, next steps
+- `submissions/koral/placer.py` — `LKPlacer` main class + FastEvaluator + LK/LAHC bodies (~1380 lines)
+- `submissions/koral/gp.py` — Phase α focused electrostatic GP (FFT Poisson solver, RUDY surrogate, multi-replica with REX)
+- `submissions/koral/placer_old.py`, `fast_eval.py`, `bookshelf.py`, etc. — dead, kept for reference
 
-**Dev loop (Docker — no build needed, uses standard image):**
+**Dev loop (Docker — no build needed, uses standard pytorch image):**
 ```bash
-# Single benchmark test
+# Single benchmark with visualization
 docker run --rm --runtime=nvidia --gpus all \
   -v "C:/Users/kulac/Documents/GitHub/macro-place-challenge-2026:/challenge" \
   --network none --entrypoint bash koral-placer-xplace \
-  -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py -b ibm01"
+  -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py -b ibm01 --vis"
 
 # Full submission run
 docker run --rm --runtime=nvidia --gpus all \
@@ -162,7 +180,7 @@ docker run --rm --runtime=nvidia --gpus all \
   -c "cd /challenge && python3 -m macro_place.evaluate submissions/koral/placer.py --all"
 ```
 
-Note: `placer.py` is bind-mounted and visible live. No rebuild needed for code changes. The `koral-placer-xplace` image is reused for convenience (it has the right PyTorch version) but does not use Xplace at all.
+Both `placer.py` and `gp.py` are bind-mounted live. The `koral-placer-xplace` image is reused only for its PyTorch version — Xplace is no longer used.
 
 ## Reproducibility Warning
 
