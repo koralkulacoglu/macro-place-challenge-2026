@@ -16,15 +16,18 @@ import time
 import importlib.util
 import concurrent.futures
 import multiprocessing
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import torch
-
 from macro_place.benchmark import Benchmark
-# Import the physics engine
-from .engine import StaticDesignData, FastEvaluator, lahc_polish
+
+me = Path(__file__).resolve().parent
+if str(me) not in sys.path:
+    sys.path.append(str(me))
+
+from engine import StaticDesignData, FastEvaluator, lahc_polish
 
 # ────────────────────────────────────────────────────────────────────────────
 # Phase 0 — Legalization
