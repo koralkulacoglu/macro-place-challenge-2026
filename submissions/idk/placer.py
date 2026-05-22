@@ -82,7 +82,11 @@ def _load_plc(name: str):
 
     root = Path("external/MacroPlacement/Testcases/ICCAD04") / name
     if root.exists():
-        _, plc = load_benchmark_from_dir(str(root))
+        # Use as_posix() so plc_client_os's rsplit('/') works on Windows too.
+        _, plc = load_benchmark(
+            (root / "netlist.pb.txt").as_posix(),
+            (root / "initial.plc").as_posix(),
+        )
         return plc
     ng45 = {
         "ariane133_ng45": "ariane133",
@@ -104,7 +108,8 @@ def _load_plc(name: str):
         )
         if (base / "netlist.pb.txt").exists():
             _, plc = load_benchmark(
-                str(base / "netlist.pb.txt"), str(base / "initial.plc")
+                (base / "netlist.pb.txt").as_posix(),
+                (base / "initial.plc").as_posix(),
             )
             return plc
     return None
