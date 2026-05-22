@@ -964,20 +964,33 @@ class GraphGradPlacer:
         n_epochs: int = 8,
         steps_per_epoch: int = 500,
         grid_res: int = 32,
-        time_budget_s: float = 3300.0,     # 50 min
+        time_budget_s: float = 3300.0,     # 55 min: 10 min koral + 45 min LAHC + margin
         verbose: bool = True,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
         soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
-        n_restarts: int = 0,               # Independent restarts with different RNG seeds
+        n_restarts: int = 1,               # Independent restarts with different RNG seeds
         # LAHC tail stage (runs after analytical placement; bit-exact incremental
         # proxy via FastEvaluator). Does NOT change koral's placement process —
         # it only polishes the result. Disable with run_lahc=False.
         run_lahc: bool = True,
         lahc_budget_s: float = 2700.0,     # remaining budget after koral
         lahc_list_len: int = 100,
-        lahc_min_budget_s: float = 60.0,
+        lahc_min_budget_s: float = 2700.0, # hard floor: 45 min minimum for LAHC
         lahc_log_interval_s: float = 15.0,
+        # Hard cap on the koral stage (Adam loop + top-K scoring + anchor check).
+        # When this is hit, koral aborts whatever stage it's in and hands off
+        # to LAHC. Default 10 min ensures LAHC always gets ≥45 min.
+        koral_max_budget_s: float = 600.0,
+        # Top-K oracle scoring early-exit: stop scoring candidates once we've
+        # had `koral_scoring_plateau_threshold` consecutive scores without
+        # improvement. Floor of `koral_scoring_min_candidates` always scored.
+        # Crucial on large designs (ibm17-18) where each oracle call costs 15s+.
+        koral_scoring_plateau_threshold: int = 4,
+        koral_scoring_min_candidates: int = 8,
+        # Cap on the top-K candidates scored against the oracle in soft-only
+        # mode. Lower = faster (each oracle call is 5-15s on big designs).
+        koral_k_eval: int = 24,
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -995,6 +1008,12 @@ class GraphGradPlacer:
         self.lahc_list_len = lahc_list_len
         self.lahc_min_budget_s = lahc_min_budget_s
         self.lahc_log_interval_s = lahc_log_interval_s
+        self.koral_max_budget_s = koral_max_budget_s
+        self.koral_scoring_plateau_threshold = koral_scoring_plateau_threshold
+        self.koral_scoring_min_candidates = koral_scoring_min_candidates
+        self.koral_k_eval = koral_k_eval
+        # Filled in by place(); used by inner loops as a hard wall-clock deadline.
+        self._koral_deadline: Optional[float] = None
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1012,10 +1031,12 @@ class GraphGradPlacer:
         # Hard-locked soft-only mode (proven sub-anchor on ibm01: 0.886 vs 1.039).
         # See _place_soft_only for the full schedule + safety net.
         t0 = time.time()
+        # Hard wall-clock deadline for the entire koral stage.
+        self._koral_deadline = t0 + self.koral_max_budget_s
         self._log(
             f"place: config  lock_hard={self.lock_hard}  n_restarts={self.n_restarts}  "
             f"pop_size={self.pop_size}  soft_steps={self.soft_steps}  "
-            f"run_lahc={self.run_lahc}"
+            f"run_lahc={self.run_lahc}  koral_max={self.koral_max_budget_s:.0f}s"
         )
         if self.lock_hard:
             koral_positions = self._place_soft_only(benchmark)
@@ -1071,6 +1092,8 @@ class GraphGradPlacer:
 
         # FastEvaluator picks up positions from benchmark.macro_positions
         benchmark.macro_positions = torch.from_numpy(best_pos_np).float()
+        self._log("LAHC tail: building FastEvaluator (~5-10s on large designs)...")
+        _fe_t0 = time.time()
         try:
             ev = FastEvaluator(benchmark, plc)
         except Exception as e:
@@ -1079,7 +1102,10 @@ class GraphGradPlacer:
 
         fast_cost = ev.proxy_cost()["proxy_cost"]
         drift = abs(fast_cost - best_cost) if best_cost != float("inf") else 0.0
-        self._log(f"LAHC tail FastEvaluator: fast={fast_cost:.4f} drift={drift:.4f}")
+        self._log(
+            f"LAHC tail FastEvaluator: built in {time.time()-_fe_t0:.1f}s  "
+            f"fast={fast_cost:.4f}  drift={drift:.4f}"
+        )
         if drift > 5e-3 and best_cost != float("inf"):
             self._log(f"  WARNING: FastEvaluator/oracle drift={drift:.4f}; LAHC may misrank")
 
@@ -1198,11 +1224,6 @@ class GraphGradPlacer:
         h_per_um = float(benchmark.hroutes_per_micron)
         v_per_um = float(benchmark.vroutes_per_micron)
 
-        # Pre-load plc and Evaluator for early exit checks
-        self._log("Loading plc and FastEvaluator for early exit checks...")
-        plc = _load_plc(benchmark.name)
-        ev = FastEvaluator(benchmark, plc) if plc is not None else None
-
         # Legalize hard macros once at initial.plc → anchor.
         init_pos = benchmark.macro_positions[:n_hard].numpy().astype(np.float64)
         hard_legal = _legalize(init_pos, sizes_np, movable_np, cw, ch, gap=0.005)
@@ -1224,7 +1245,19 @@ class GraphGradPlacer:
         opt = torch.optim.Adam([pop], lr=self.soft_lr)
 
         n_steps = self.soft_steps
+        # Reserve ~10% of the koral budget for top-K scoring + anchor check.
+        adam_deadline = (
+            self._koral_deadline - 0.10 * self.koral_max_budget_s
+            if self._koral_deadline is not None else None
+        )
         for step in range(n_steps):
+            # Hard wall-clock check: bail early if the koral budget is almost up.
+            if adam_deadline is not None and time.time() >= adam_deadline:
+                self._log(
+                    f"  Adam deadline hit at step {step}/{n_steps} "
+                    f"(reserving rest of koral budget for top-K scoring)"
+                )
+                break
             opt.zero_grad()
             progress = step / max(n_steps, 1)
             gamma = 1.0 * (0.05 ** progress)  # WAHPWL smoothing → sharp Manhattan HPWL
@@ -1248,25 +1281,6 @@ class GraphGradPlacer:
                 pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
                 pop[:, :n_hard] = hard_legal_t  # reassert lock
-                
-                # Early exit check: evaluate convergence using FastEvaluator on Top-4
-                if step > 0 and step % 10 == 0 and K > 1 and ev is not None:
-                    k_check = min(K, 4)
-                    _, top_idx_t = torch.topk(proxy_surr, k=k_check, largest=False)
-                    top_idx = top_idx_t.tolist()
-                    
-                    real_costs = []
-                    for k_idx in top_idx:
-                        pos_np = pop[k_idx].detach().cpu().numpy().astype(np.float64)
-                        pos_np = self._clip_soft_to_canvas(pos_np, benchmark, n_hard, cw, ch)
-                        ev.restore(pos_np) # this calls _init_caches
-                        real_costs.append(ev.proxy_cost()["proxy_cost"])
-                    
-                    c_min, c_max = min(real_costs), max(real_costs)
-                    if c_max - c_min < 1e-3:
-                        self._log(f"  early exit at step {step}: Real FastEvaluator range {c_max - c_min:.2e} < 1e-3")
-                        break
-
             if self.verbose and step % max(n_steps // 6, 1) == 0:
                 self._log(
                     f"  step {step}: wl_n={wl_n.mean().item():.4f} "
@@ -1287,21 +1301,61 @@ class GraphGradPlacer:
                 h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
             )
             surr = wl_n + 0.5 * dens + 0.5 * cong
-        k_eval = min(K, max(8, K // 2))
+        k_eval = min(K, self.koral_k_eval)
         top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
 
-        # plc is already loaded at the start
+        # Cache plc once — each _load_plc reparses the netlist (~seconds)
+        plc = _load_plc(benchmark.name)
         best_full, best_cost = None, float("inf")
-        for k in top_idx:
+        plateau_th = self.koral_scoring_plateau_threshold
+        min_scored = max(self.koral_scoring_min_candidates, plateau_th)
+        self._log(
+            f"top-K oracle scoring: up to {len(top_idx)} candidates  "
+            f"(plateau early-exit after {plateau_th} non-improving scores, "
+            f"min {min_scored} always scored)"
+        )
+        _score_t0 = time.time()
+        _score_last_log = _score_t0
+        no_improve = 0
+        scored_total = 0
+        for _i, k in enumerate(top_idx):
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
             pos_full = self._clip_soft_to_canvas(pos_full, benchmark, n_hard, cw, ch)
             full_t = torch.from_numpy(pos_full).float()
             if plc is None:
                 continue
             c = compute_proxy_cost(full_t, benchmark, plc)
-            if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
+            scored_total = _i + 1
+            improved = c["overlap_count"] == 0 and c["proxy_cost"] < best_cost
+            if improved:
                 best_cost = c["proxy_cost"]
                 best_full = full_t
+                no_improve = 0
+            else:
+                no_improve += 1
+            # Heartbeat: print at least every 15s so it doesn't look stuck.
+            if self.verbose and (time.time() - _score_last_log >= 15.0 or _i == len(top_idx) - 1):
+                self._log(
+                    f"  scored {scored_total}/{len(top_idx)} "
+                    f"elapsed={time.time()-_score_t0:.0f}s "
+                    f"best_so_far={best_cost:.4f}  no_improve={no_improve}"
+                )
+                _score_last_log = time.time()
+            # Plateau early-exit (after we've scored at least min_scored)
+            if scored_total >= min_scored and no_improve >= plateau_th:
+                self._log(
+                    f"  plateau: {no_improve} non-improving candidates in a row; "
+                    f"stopping early at {scored_total}/{len(top_idx)} "
+                    f"(saved ~{(len(top_idx)-scored_total)*((time.time()-_score_t0)/scored_total):.0f}s)"
+                )
+                break
+            # Hard wall-clock check: respect the koral budget ceiling.
+            if self._koral_deadline is not None and time.time() >= self._koral_deadline:
+                self._log(
+                    f"  koral deadline hit during scoring at {scored_total}/{len(top_idx)}; "
+                    f"handing off to LAHC"
+                )
+                break
         # Anchor safety net
         full_anc = torch.zeros(n_macros, 2)
         full_anc[:n_hard] = hard_legal_t.cpu()
