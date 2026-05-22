@@ -48,8 +48,7 @@ Any benchmark with a hard macro overlap → disqualified entirely.
 - Leaderboard rank 1: 0.9671 avg (Carrotato — Triton+Xplace+congestion-aware GP)
 - Leaderboard rank 5: 1.037 (Cezar)
 - Leaderboard rank 10: 1.1764 (KLA MACH — DREAMPlace+CD+SA+ILS)
-- Full `--all` baseline (GraphGradPlacer, pre-LKPlacer): **1.2240 avg**
-- Full `--all` with LKPlacer: pending (ibm12 alone improved 9% to 1.2035 — expect full avg ~1.05-1.10)
+- Full `--all` baseline (GraphGradPlacer, early version): **1.2240 avg**
 
 ## Architecture
 
@@ -121,48 +120,40 @@ If you have non-standard deps, include a `Dockerfile` in your submission. Otherw
 
 ## Our Submission: `submissions/idk/`
 
-**`LKPlacer`** — Five-phase placer: focused electrostatic GP front-end → Lin-Kernighan k-opt refinement → LAHC (Late Acceptance Hill Climbing) deep polish. Pure PyTorch + NumPy, no external tools, no Docker rebuild required.
+**`GraphGradPlacer`** — Two-stage placer: soft-macro analytical GP (Adam optimizer, TILOS-faithful surrogate) followed by LAHC deep polish. Pure PyTorch + NumPy, no external tools, no Docker rebuild required.
 
 **Pipeline:**
 
 ```
-[Phase α  Focused Electrostatic GP]
-   pop_size=4 replicas, ~90s budget, with replica-exchange (REX)
-   FFT Poisson solver over density grid (only top-10% density cells contribute,
-   matching the TILOS proxy which uses top-10% mean)
-   Differentiable RUDY with focused congestion (only top-5% cells contribute)
-   Pick best replica by oracle proxy cost
-       │
-[Phase 0  Legalize] greedy push-apart + spiral fallback
-       │
-[Phase 1  FastEvaluator] bit-exact mirror of PlacementCost
-   ~100-500× faster than the oracle for inner SA/LK loops
-       │
-[Phase α₂  Stochastic true-cost subgradient] ~60s
-   Discrete proposal-and-test moves on the calibrated FastEvaluator,
-   keeping the best position by oracle
-       │
-[Phase 2  Lin-Kernighan k-opt swaps]  ~3 passes
-   Macro priority queue; chain-depth k-opt swaps of hard macros that
-   reduce fast proxy cost
-       │
-[Phase 3  LAHC polish]  fills the remaining budget (typically 40-50 min)
-   Late Acceptance Hill Climbing with mixed hard/soft macro moves
-   including partner-centroid biased proposals
+[Stage 1  Soft-Only Analytical GP]  ~5 min (gp_max_budget_s=300s)
+   96 parallel soft-macro layouts optimized via Adam
+   Hard macros locked at legalized initial.plc positions
+   TILOS-faithful surrogate: exact density port (top-10% mean),
+   WAHPWL normalized like the oracle, RUDY congestion with
+   TILOS per-axis track normalization + 1D smoothing kernel
+   Top-24 candidates scored by oracle; best zero-overlap result kept
+       |
+[Stage 2  FastEvaluator + LAHC]  ~49 min (lahc_min_budget_s=2970s)
+   Bit-exact NumPy mirror of PlacementCost (~2000x faster per move)
+   Late Acceptance Hill Climbing: L=100 history list
+   Mixed moves: hard macro slide/swap + centroid-biased soft macro translate
+   Best-ever placement tracked; oracle-verified before commit
 ```
 
-**Why this design wins:**
-- **Right compute allocation.** Phase α (cheap parallel GP) takes ~90s, Phase 3 LAHC (deep single-trajectory refinement) takes ~50 min. ~98% of the budget goes to deep refinement, not parallel exploration.
-- **Calibrated FastEvaluator.** Makes ~1M iterations of LAHC feasible (~30 μs/move).
-- **No locked-hard restriction.** Hard macros move freely throughout LAHC; soft macros move alongside (via partner-centroid moves).
-- **TILOS-faithful surrogate.** Phase α uses focused Poisson + focused RUDY matching the proxy's top-k% reductions, so GP gradients drive the actual scoring function.
-
-**Verified score:**
-- ibm12: **1.2035** VALID (3015s = 50.3 min) — beats our prior best (1.3248) by 9.2%, beats RePlAce baseline (1.7261) by 30%.
+**Why this design:**
+- **TILOS-faithful surrogate.** The GP surrogate is an exact differentiable port of the judging metric — same density formula, same WL normalization, same congestion smoothing — so gradients point in the direction that actually lowers the score.
+- **FastEvaluator speedup.** ~2000x faster than the oracle per incremental move enables ~1.5M LAHC iterations in the remaining budget.
+- **Soft-only GP avoids legalization thrash.** Locking hard macros during GP means no expensive re-legalization between Adam steps; LAHC then freely moves both hard and soft macros.
 
 **Key files:**
-- `submissions/idk/placer.py` — `LKPlacer` main class + FastEvaluator + LK/LAHC bodies (~1380 lines)
-- `submissions/idk/gp.py` — Phase α focused electrostatic GP (FFT Poisson solver, RUDY surrogate, multi-replica with REX)
+- `submissions/idk/placer.py` — `GraphGradPlacer` main class + `FastEvaluator` + `lahc_polish` (~2350 lines)
+- `submissions/idk/gp.py` — older focused electrostatic GP module (not actively used)
+
+**Key parameters (in `GraphGradPlacer.__init__`):**
+- `gp_max_budget_s=300` — hard cap on the GP stage (5 min)
+- `lahc_min_budget_s=2970` — LAHC floor (~49.5 min)
+- `pop_size=96` — parallel soft-macro replicas
+- `gp_k_eval=24` — top-K candidates scored by oracle after Adam
 
 **Dev loop (Docker — no build needed, uses standard pytorch image):**
 ```bash
@@ -179,7 +170,7 @@ docker run --rm --runtime=nvidia --gpus all \
   -c "cd /challenge && python3 -m macro_place.evaluate submissions/idk/placer.py --all"
 ```
 
-Both `placer.py` and `gp.py` are bind-mounted live. The `koral-placer-xplace` image is reused only for its PyTorch version — Xplace is no longer used.
+`placer.py` is bind-mounted live. The `koral-placer-xplace` image is reused only for its PyTorch environment.
 
 ## Reproducibility Warning
 
