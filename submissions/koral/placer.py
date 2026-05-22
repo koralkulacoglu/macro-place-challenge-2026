@@ -14,7 +14,6 @@ from __future__ import annotations
 import math
 import random
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -137,17 +136,27 @@ def _legalize(
 # ────────────────────────────────────────────────────────────────────────────
 
 
-@dataclass
 class StaticDesignData:
     """Pickleable container for design-specific constants extracted from PlacementCost."""
-    h_alloc: float
-    v_alloc: float
-    smooth_range: int
-    wl_norm_n_nets: int
-    net_weight: np.ndarray
-    net_owner: List[np.ndarray]
-    net_offx: List[np.ndarray]
-    net_offy: List[np.ndarray]
+    def __init__(
+        self,
+        h_alloc: float,
+        v_alloc: float,
+        smooth_range: int,
+        wl_norm_n_nets: int,
+        net_weight: np.ndarray,
+        net_owner: List[np.ndarray],
+        net_offx: List[np.ndarray],
+        net_offy: List[np.ndarray],
+    ):
+        self.h_alloc = h_alloc
+        self.v_alloc = v_alloc
+        self.smooth_range = smooth_range
+        self.wl_norm_n_nets = wl_norm_n_nets
+        self.net_weight = net_weight
+        self.net_owner = net_owner
+        self.net_offx = net_offx
+        self.net_offy = net_offy
 
     @staticmethod
     def extract(benchmark: Benchmark, plc) -> StaticDesignData:
