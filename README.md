@@ -1,5 +1,5 @@
 # NOTE
-The placer module is located in ``submissions/koral/placer.py``.
+The placer module is located in ``submissions/idk/placer.py``.
 
 # Partcl/HRT Macro Placement Challenge
 
