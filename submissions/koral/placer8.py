@@ -1243,6 +1243,16 @@ class GraphGradPlacer:
                 pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
                 pop[:, :n_hard] = hard_legal_t  # reassert lock
+                
+                # Early exit check: evaluate convergence of the elite (Top-4) candidates
+                if step > 0 and step % 10 == 0: # Check every 10 steps for efficiency
+                    k_check = min(K, 4)
+                    top_vals, _ = torch.topk(-proxy_surr, k=k_check)
+                    best_s, ref_s = -top_vals[0].item(), -top_vals[min(3, k_check-1)].item()
+                    if abs(ref_s - best_s) < 1e-3:
+                        self._log(f"  early exit at step {step}: elite surrogate range {abs(ref_s-best_s):.2e} < 1e-3")
+                        break
+
             if self.verbose and step % max(n_steps // 6, 1) == 0:
                 self._log(
                     f"  step {step}: wl_n={wl_n.mean().item():.4f} "
@@ -1264,17 +1274,7 @@ class GraphGradPlacer:
             )
             surr = wl_n + 0.5 * dens + 0.5 * cong
         k_eval = min(K, max(8, K // 2))
-        top_res = torch.topk(-surr, k=k_eval)
-        top_idx = top_res.indices.tolist()
-
-        # Early exit: assume convergence if the elite (Top-4) candidates are very close
-        if len(top_idx) > 1:
-            check_idx = min(3, len(top_idx) - 1)
-            best_s = -top_res.values[0].item()
-            ref_s = -top_res.values[check_idx].item()
-            if abs(ref_s - best_s) < 1e-3:
-                self._log(f"  early exit step {step}: Top-1 vs Top-{check_idx+1} range {abs(ref_s-best_s):.2e} < 1e-3")
-                break
+        top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
 
         # Cache plc once — each _load_plc reparses the netlist (~seconds)
         plc = _load_plc(benchmark.name)
