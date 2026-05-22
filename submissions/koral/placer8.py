@@ -1198,6 +1198,11 @@ class GraphGradPlacer:
         h_per_um = float(benchmark.hroutes_per_micron)
         v_per_um = float(benchmark.vroutes_per_micron)
 
+        # Pre-load plc and Evaluator for early exit checks
+        self._log("Loading plc and FastEvaluator for early exit checks...")
+        plc = _load_plc(benchmark.name)
+        ev = FastEvaluator(benchmark, plc) if plc is not None else None
+
         # Legalize hard macros once at initial.plc → anchor.
         init_pos = benchmark.macro_positions[:n_hard].numpy().astype(np.float64)
         hard_legal = _legalize(init_pos, sizes_np, movable_np, cw, ch, gap=0.005)
@@ -1244,13 +1249,22 @@ class GraphGradPlacer:
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
                 pop[:, :n_hard] = hard_legal_t  # reassert lock
                 
-                # Early exit check: evaluate convergence of the elite (Top-4) candidates
-                if step > 0 and step % 10 == 0 and K > 1:
+                # Early exit check: evaluate convergence using FastEvaluator on Top-4
+                if step > 0 and step % 10 == 0 and K > 1 and ev is not None:
                     k_check = min(K, 4)
-                    top_costs, _ = torch.topk(proxy_surr, k=k_check, largest=False)
-                    delta = top_costs[-1] - top_costs[0]
-                    if delta < 1e-3:
-                        self._log(f"  early exit at step {step}: elite range {delta.item():.2e} < 1e-3")
+                    _, top_idx_t = torch.topk(proxy_surr, k=k_check, largest=False)
+                    top_idx = top_idx_t.tolist()
+                    
+                    real_costs = []
+                    for k_idx in top_idx:
+                        pos_np = pop[k_idx].detach().cpu().numpy().astype(np.float64)
+                        pos_np = self._clip_soft_to_canvas(pos_np, benchmark, n_hard, cw, ch)
+                        ev.restore(pos_np) # this calls _init_caches
+                        real_costs.append(ev.proxy_cost()["proxy_cost"])
+                    
+                    c_min, c_max = min(real_costs), max(real_costs)
+                    if c_max - c_min < 1e-3:
+                        self._log(f"  early exit at step {step}: Real FastEvaluator range {c_max - c_min:.2e} < 1e-3")
                         break
 
             if self.verbose and step % max(n_steps // 6, 1) == 0:
@@ -1276,8 +1290,7 @@ class GraphGradPlacer:
         k_eval = min(K, max(8, K // 2))
         top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
 
-        # Cache plc once — each _load_plc reparses the netlist (~seconds)
-        plc = _load_plc(benchmark.name)
+        # plc is already loaded at the start
         best_full, best_cost = None, float("inf")
         for k in top_idx:
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
