@@ -42,7 +42,7 @@ def compare_gp_stochastic(bench_name="ibm01", n_steps=200):
     baseline_cache = Path("gp_baseline.pt")
     if baseline_cache.exists():
         print("\n>>> Loading Original GP Baseline from cache...")
-        checkpoint = torch.load(baseline_cache)
+        checkpoint = torch.load(baseline_cache, weights_only=False)
         pos_orig = checkpoint['pos']
         hist_orig = checkpoint['hist']
         time_orig = checkpoint['time']
@@ -77,36 +77,19 @@ def compare_gp_stochastic(bench_name="ibm01", n_steps=200):
     print("="*55)
 
     # Plotting
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f"Stochastic GP Comparison: {bench_name}", fontsize=16)
+    fig, axes = plt.subplots(1, 1, figsize=(10, 8))
+    fig.suptitle(f"Stochastic GP Comparison (Means): {bench_name}", fontsize=16)
 
-    # 1. Real Proxy Cost
-    axes[0, 0].plot(hist_orig['real_proxy'], label='Original', alpha=0.7)
-    axes[0, 0].plot(hist_alt['real_proxy'], label='Alt (Noise)', alpha=0.7)
-    axes[0, 0].set_title("Real Proxy Cost (FastEvaluator)")
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
+    # 1. Real Proxy Cost (Mean)
+    h_orig = np.array(hist_orig['real_proxy'])
+    axes.plot(h_orig, color='C0', label='Baseline (Mean)', linewidth=2)
+            
+    h_alt = np.array(hist_alt['real_proxy'])
+    axes.plot(h_alt, color='C1', label='Alt (Mean)', linewidth=2)
 
-    # 2. Real Congestion
-    axes[0, 1].plot(hist_orig['real_cong'], label='Original', alpha=0.7)
-    axes[0, 1].plot(hist_alt['real_cong'], label='Alt (Noise)', alpha=0.7)
-    axes[0, 1].set_title("Real Congestion")
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
-
-    # 3. Real Wirelength
-    axes[1, 0].plot(hist_orig['real_wl'], label='Original', alpha=0.7)
-    axes[1, 0].plot(hist_alt['real_wl'], label='Alt (Noise)', alpha=0.7)
-    axes[1, 0].set_title("Real Wirelength")
-    axes[1, 0].legend()
-    axes[1, 0].grid(True)
-
-    # 4. Real Density
-    axes[1, 1].plot(hist_orig['real_dens'], label='Original', alpha=0.7)
-    axes[1, 1].plot(hist_alt['real_dens'], label='Alt (Noise)', alpha=0.7)
-    axes[1, 1].set_title("Real Density")
-    axes[1, 1].legend()
-    axes[1, 1].grid(True)
+    axes.set_title("Official Proxy Cost (FastEvaluator)")
+    axes.legend()
+    axes.grid(True)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plot_path = "gp_noise_comparison.png"

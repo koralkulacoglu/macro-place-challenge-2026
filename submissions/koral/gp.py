@@ -26,7 +26,7 @@ legalizer + LK + LAHC pipeline polishes.
 
 Usage
 -----
-    from submissions.lk_placer.gp import run_global_placement
+    from submissions.koral.gp import run_global_placement
     positions = run_global_placement(benchmark, plc, time_budget_s=120.0)
 """
 from __future__ import annotations
@@ -353,12 +353,9 @@ def dfg_demand(
     K = pop.shape[0]
     device, dtype = pop.device, pop.dtype
     pins = _pin_positions(pop, owner_idx, pin_off, port_pos, n_macros)
-    drivers = pins[:, driver_idx_per_pin, :]
-    sinks = pins
-    h_x_min, h_x_max = torch.min(drivers[..., 0], sinks[..., 0]), torch.max(drivers[..., 0], sinks[..., 0])
-    h_y_fixed = drivers[..., 1]
-    v_y_min, v_y_max = torch.min(drivers[..., 1], sinks[..., 1]), torch.max(drivers[..., 1], sinks[..., 1])
-    v_x_fixed = sinks[..., 0]
+    drivers, sinks = pins[:, driver_idx_per_pin, :], pins
+    h_x_min, h_x_max, h_y_fixed = torch.min(drivers[..., 0], sinks[..., 0]), torch.max(drivers[..., 0], sinks[..., 0]), drivers[..., 1]
+    v_y_min, v_y_max, v_x_fixed = torch.min(drivers[..., 1], sinks[..., 1]), torch.max(drivers[..., 1], sinks[..., 1]), sinks[..., 0]
     grid_w, grid_h = cw / grid_col, ch / grid_row
     col_l = torch.arange(grid_col, device=device, dtype=dtype) * grid_w
     col_r, row_b = col_l + grid_w, torch.arange(grid_row, device=device, dtype=dtype) * grid_h
@@ -387,12 +384,9 @@ def dfg_demand(
 
 
 def focused_dual_electrostatic_cong_loss(
-    v_demand: torch.Tensor,
-    h_demand: torch.Tensor,
-    v_macro_block: torch.Tensor,
-    h_macro_block: torch.Tensor,
-    smooth_range: int,
-    top_k_frac: float = 0.05,
+    v_demand: torch.Tensor, h_demand: torch.Tensor,
+    v_macro_block: torch.Tensor, h_macro_block: torch.Tensor,
+    smooth_range: int, top_k_frac: float = 0.05,
 ) -> torch.Tensor:
     v_s = _smooth_1d_along_axis(v_demand + v_macro_block, smooth_range, axis=0)
     h_s = _smooth_1d_along_axis(h_demand + h_macro_block, smooth_range, axis=1)
@@ -411,48 +405,19 @@ def focused_dual_electrostatic_cong_loss(
 def pairwise_overlap(pos_hard: torch.Tensor, sizes_hard: torch.Tensor) -> torch.Tensor:
     K, N, _ = pos_hard.shape
     if N <= 1: return torch.zeros(K, device=pos_hard.device)
-    xi, xj = pos_hard[:, :, 0].unsqueeze(2), pos_hard[:, :, 0].unsqueeze(1)
-    yi, yj = pos_hard[:, :, 1].unsqueeze(2), pos_hard[:, :, 1].unsqueeze(1)
-    wi, wj = sizes_hard[:, 0].view(1, N, 1), sizes_hard[:, 0].view(1, 1, N)
-    hi, hj = sizes_hard[:, 1].view(1, N, 1), sizes_hard[:, 1].view(1, 1, N)
-    ox = ((wi + wj) / 2 - (xi - xj).abs()).clamp(min=0.0)
-    oy = ((hi + hj) / 2 - (yi - yj).abs()).clamp(min=0.0)
+    xi, xj, yi, yj = pos_hard[:, :, 0:1], pos_hard[:, None, :, 0], pos_hard[:, :, 1:2], pos_hard[:, None, :, 1]
+    wi, wj, hi, hj = sizes_hard[:, 0:1], sizes_hard[None, :, 0], sizes_hard[:, 1:2], sizes_hard[None, :, 1]
+    ox, oy = ((wi + wj) / 2 - (xi - xj).abs()).clamp(min=0.0), ((hi + hj) / 2 - (yi - yj).abs()).clamp(min=0.0)
     mask = 1 - torch.eye(N, device=pos_hard.device).view(1, N, N)
-    return ((ox * oy) * mask).sum(dim=(1, 2)) / 2
+    return ((ox.squeeze(-1) * oy.squeeze(-1)) * mask).sum(dim=(1, 2)) / 2
 
 
 def run_global_placement(
-    benchmark: Benchmark,
-    plc=None,
-    *,
-    pop_size: int = 4,
-    n_steps: int = 500,
-    lr: float = 0.03,
-    gamma_start: float = 1.0,
-    gamma_end: float = 0.05,
-    density_w_start: float = 0.0,
-    density_w_end: float = 1.0,
-    cong_w_start: float = 0.0,
-    cong_w_end: float = 1.0,
-    overlap_w_start: float = 0.0,
-    overlap_w_end: float = 200.0,
-    top_k_density: float = 0.10,
-    top_k_cong: float = 0.05,
-    push_factor: float = 1.0,
-    smooth_range: int = 2,
-    time_budget_s: float = 120.0,
-    seed: int = 0,
-    replica_swap_every: int = 50,
-    replica_temperatures: Optional[Tuple[float, ...]] = None,
-    verbose: bool = True,
-    log_every: int = 50,
-    use_dfg: bool = False,
-) -> Tuple[np.ndarray, Dict]:
+    benchmark: Benchmark, plc=None, *, pop_size=4, n_steps=500, lr=0.03, gamma_start=1.0, gamma_end=0.05, density_w_start=0.0, density_w_end=1.0, cong_w_start=0.0, cong_w_end=1.0, overlap_w_start=0.0, overlap_w_end=200.0, top_k_density=0.10, top_k_cong=0.05, push_factor=1.0, smooth_range=2, time_budget_s=120.0, seed=0, replica_swap_every=50, replica_temperatures=None, verbose=True, log_every=50, use_dfg=False
+) -> np.ndarray:
     from macro_place.objective import compute_proxy_cost
-    from .placer import FastEvaluator
     device = _device()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    torch.manual_seed(seed); np.random.seed(seed)
     n_hard, n_macros = benchmark.num_hard_macros, benchmark.num_macros
     cw, ch = float(benchmark.canvas_width), float(benchmark.canvas_height)
     grid_col, grid_row = int(benchmark.grid_cols), int(benchmark.grid_rows)
@@ -478,38 +443,25 @@ def run_global_placement(
         try: h_alloc, v_alloc = plc.get_macro_routing_allocation()
         except Exception: h_alloc, v_alloc = getattr(plc, "hrouting_alloc", 0.0), getattr(plc, "vrouting_alloc", 0.0)
     init_pos = benchmark.macro_positions.to(device).float()
-    pop = init_pos.unsqueeze(0).expand(pop_size, -1, -1).contiguous()
-    rng = torch.Generator(device=device).manual_seed(seed)
-    jitter_levels = torch.linspace(0.0, 0.10, pop_size, device=device)
-    for k in range(pop_size):
-        if jitter_levels[k] > 0:
-            pop[k] = pop[k] + torch.randn(n_macros, 2, generator=rng, device=device) * float(jitter_levels[k]) * min(cw, ch)
-    for k in range(pop_size):
-        pop[k, :, 0].clamp_(min=half_w, max=cw - half_w)
-        pop[k, :, 1].clamp_(min=half_h, max=ch - half_h)
-    pop = pop.clone().requires_grad_(True)
+    pop = init_pos.unsqueeze(0).expand(pop_size, -1, -1).contiguous().clone().requires_grad_(True)
     opt = torch.optim.Adam([pop], lr=lr)
     fixed_mask, fixed_pos = benchmark.macro_fixed.to(device), init_pos.clone()
     if replica_temperatures is None: replica_temperatures = tuple(0.01 * (2.0 ** k) for k in range(pop_size))
     swap_rng = np.random.default_rng(seed + 7)
     dyn_net_weights = weights_per_net.clone() if weights_per_net is not None else torch.ones(n_nets, device=device)
-    fe = FastEvaluator(benchmark, plc) if plc is not None else None
-    t0, history = time.time(), {"wl": [], "dens": [], "cong": [], "ov": [], "total": [], "real_proxy": [], "real_wl": [], "real_dens": [], "real_cong": []}
+    t0 = time.time()
     for step in range(n_steps):
         if time.time() - t0 > time_budget_s: break
         progress = step / max(n_steps - 1, 1)
         gamma = gamma_start * (gamma_end / gamma_start) ** progress
-        density_w = density_w_start + (density_w_end - density_w_start) * progress
-        cong_w = cong_w_start + (cong_w_end - cong_w_start) * progress
-        overlap_w = overlap_w_start * (1 - progress) + overlap_w_end * progress
+        density_w, cong_w, overlap_w = density_w_start + (density_w_end - density_w_start) * progress, cong_w_start + (cong_w_end - cong_w_start) * progress, overlap_w_start * (1 - progress) + overlap_w_end * progress
         opt.zero_grad()
         wl = smooth_hpwl(pop, owner_idx, pin_off, net_id, n_nets, port_pos, n_macros, gamma, cw, ch, n_nets_norm, weights_per_net=dyn_net_weights)
         dens_grid = bilinear_density(pop, sizes, grid_col, grid_row, cw, ch)
         dens_loss = focused_electrostatic_loss(dens_grid, top_k_density, push_factor)
         if use_dfg and driver_idx_per_pin is not None:
             v_dem, h_dem = dfg_demand(pop, owner_idx, pin_off, net_id, n_nets, port_pos, n_macros, grid_col, grid_row, cw, ch, h_per_um, v_per_um, driver_idx_per_pin)
-            hard_dens = bilinear_density(pop[:, :n_hard], sizes[:n_hard], grid_col, grid_row, cw, ch)
-            cong_loss = focused_dual_electrostatic_cong_loss(v_dem, h_dem, hard_dens * (v_alloc / max(grid_w * v_per_um, 1e-9)), hard_dens * (h_alloc / max(grid_h * h_per_um, 1e-9)), smooth_range, top_k_cong)
+            cong_loss = focused_dual_electrostatic_cong_loss(v_dem, h_dem, bilinear_density(pop[:, :n_hard], sizes[:n_hard], grid_col, grid_row, cw, ch) * (v_alloc / max(grid_w * v_per_um, 1e-9)), bilinear_density(pop[:, :n_hard], sizes[:n_hard], grid_col, grid_row, cw, ch) * (h_alloc / max(grid_h * h_per_um, 1e-9)), smooth_range, top_k_cong)
         else:
             v_dem, h_dem = rudy_demand(pop, owner_idx, pin_off, net_id, n_nets, port_pos, n_macros, grid_col, grid_row, cw, ch, h_per_um, v_per_um)
             cong_loss = focused_congestion_loss(v_dem, h_dem, smooth_range, top_k_cong)
@@ -521,10 +473,6 @@ def run_global_placement(
         with torch.no_grad():
             pop[:, fixed_mask] = fixed_pos[fixed_mask].unsqueeze(0).expand(pop_size, -1, -1)
             for a in [0, 1]: pop[..., a].clamp_(min=half_w if a==0 else half_h, max=(cw if a==0 else ch) - (half_w if a==0 else half_h))
-            history["wl"].append(wl.mean().item()); history["dens"].append(dens_loss.mean().item()); history["cong"].append(cong_loss.mean().item()); history["ov"].append(ov_loss.mean().item()); history["total"].append(total_loss.mean().item())
-            if fe is not None:
-                fe.positions = pop[0].detach().cpu().numpy().astype(np.float64); fe._init_caches(); c = fe.proxy_cost()
-                history["real_proxy"].append(c["proxy_cost"]); history["real_wl"].append(c["wirelength_cost"]); history["real_dens"].append(c["density_cost"]); history["real_cong"].append(c["congestion_cost"])
             if pop_size > 1 and replica_swap_every > 0 and (step + 1) % replica_swap_every == 0:
                 per_replica = total_loss.detach()
                 for k in range(pop_size - 1):
@@ -542,4 +490,4 @@ def run_global_placement(
             score = float(c["proxy_cost"]) + (10.0 if c["overlap_count"] > 0 else 0.0)
             if score < best_cost: best_cost, best_pos = score, pos_np
         else: best_pos = pos_np; break
-    return best_pos, history
+    return best_pos
