@@ -1027,14 +1027,14 @@ class GraphGradPlacer:
         # proxy via FastEvaluator). Does NOT change the GP process —
         # it only polishes the result. Disable with run_lahc=False.
         run_lahc: bool = True,
-        lahc_budget_s: float = 2700.0,     # remaining budget after GP
+        lahc_budget_s: float = 2970.0,     # remaining budget after GP
         lahc_list_len: int = 100,
-        lahc_min_budget_s: float = 2700.0, # hard floor: 45 min minimum for LAHC
+        lahc_min_budget_s: float = 2970.0, # hard floor: 45 min minimum for LAHC
         lahc_log_interval_s: float = 15.0,
         # Hard cap on the GP stage (Adam loop + top-K scoring + anchor check).
         # When this is hit, the GP phase aborts whatever stage it's in and hands off
         # to LAHC. Default 7 min ensures LAHC always gets ≥48 min.
-        gp_max_budget_s: float = 420.0,
+        gp_max_budget_s: float = 300.0,
         # Cap on the top-K candidates scored against the oracle in soft-only
         # mode. Scoring also stops when the GP wall-clock deadline hits.
         # Lower = faster (each oracle call is 5-15s on big designs).
