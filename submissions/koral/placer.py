@@ -1257,7 +1257,15 @@ def parallel_lahc_polish(
     if verbose:
         print(f"  [PAR-LAHC] launching {n_chains} chains in parallel for {time_budget_s:.0f}s", flush=True)
     
-    with concurrent.futures.ProcessPoolExecutor(max_workers=n_chains) as executor:
+    # We must use 'spawn' because the main process loaded this module dynamically.
+    # 'fork' inherits a corrupted namespace where 'placer' isn't really 'placer'.
+    ctx = multiprocessing.get_context('spawn')
+    
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_chains, mp_context=ctx) as executor:
+        # We need to make sure the workers have the right sys.path BEFORE they try to unpickle the function.
+        # However, the unpickling happens during the task submission.
+        # The safest way is to ensure the parent's sys.path is already correct (we did this in place()).
+        
         futures = []
         for i in range(n_chains):
             f = executor.submit(
@@ -1272,7 +1280,7 @@ def parallel_lahc_polish(
             futures.append(f)
         
         best_cost = float("inf")
-        best_pos = None
+        best_pos = init_pos.copy() # Default to starting position if all workers fail
         total_iters = 0
         for f in concurrent.futures.as_completed(futures):
             try:
