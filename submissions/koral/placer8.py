@@ -1264,7 +1264,17 @@ class GraphGradPlacer:
             )
             surr = wl_n + 0.5 * dens + 0.5 * cong
         k_eval = min(K, max(8, K // 2))
-        top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
+        top_res = torch.topk(-surr, k=k_eval)
+        top_idx = top_res.indices.tolist()
+
+        # Early exit: assume convergence if the elite (Top-4) candidates are very close
+        if len(top_idx) > 1:
+            check_idx = min(3, len(top_idx) - 1)
+            best_s = -top_res.values[0].item()
+            ref_s = -top_res.values[check_idx].item()
+            if abs(ref_s - best_s) < 1e-3:
+                self._log(f"  early exit step {step}: Top-1 vs Top-{check_idx+1} range {abs(ref_s-best_s):.2e} < 1e-3")
+                break
 
         # Cache plc once — each _load_plc reparses the netlist (~seconds)
         plc = _load_plc(benchmark.name)
