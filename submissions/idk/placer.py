@@ -1017,7 +1017,7 @@ class GraphGradPlacer:
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
         soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
-        n_restarts: int = 1,               # Independent restarts with different RNG seeds
+        n_restarts: int = 0,               # Independent restarts with different RNG seeds
         # LAHC tail stage (runs after analytical placement; bit-exact incremental
         # proxy via FastEvaluator). Does NOT change koral's placement process —
         # it only polishes the result. Disable with run_lahc=False.
