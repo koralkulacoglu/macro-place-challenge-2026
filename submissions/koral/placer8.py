@@ -1245,12 +1245,12 @@ class GraphGradPlacer:
                 pop[:, :n_hard] = hard_legal_t  # reassert lock
                 
                 # Early exit check: evaluate convergence of the elite (Top-4) candidates
-                if step > 0 and step % 10 == 0: # Check every 10 steps for efficiency
+                if step > 0 and step % 10 == 0 and K > 1:
                     k_check = min(K, 4)
-                    top_vals, _ = torch.topk(-proxy_surr, k=k_check)
-                    best_s, ref_s = -top_vals[0].item(), -top_vals[min(3, k_check-1)].item()
-                    if abs(ref_s - best_s) < 1e-3:
-                        self._log(f"  early exit at step {step}: elite surrogate range {abs(ref_s-best_s):.2e} < 1e-3")
+                    top_costs, _ = torch.topk(proxy_surr, k=k_check, largest=False)
+                    delta = top_costs[-1] - top_costs[0]
+                    if delta < 1e-3:
+                        self._log(f"  early exit at step {step}: elite range {delta.item():.2e} < 1e-3")
                         break
 
             if self.verbose and step % max(n_steps // 6, 1) == 0:
