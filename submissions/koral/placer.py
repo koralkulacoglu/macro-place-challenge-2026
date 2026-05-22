@@ -136,120 +136,134 @@ def _legalize(
 # ────────────────────────────────────────────────────────────────────────────
 
 
+@dataclass
+class StaticDesignData:
+    """Pickleable container for design-specific constants extracted from PlacementCost."""
+    h_alloc: float
+    v_alloc: float
+    smooth_range: int
+    wl_norm_n_nets: int
+    net_weight: np.ndarray
+    net_owner: List[np.ndarray]
+    net_offx: List[np.ndarray]
+    net_offy: List[np.ndarray]
+
+    @staticmethod
+    def extract(benchmark: Benchmark, plc) -> StaticDesignData:
+        """One-time extraction from the C++ oracle."""
+        h_alloc, v_alloc = 0.0, 0.0
+        smooth_range = 2
+        n_nets = int(benchmark.num_nets)
+        if plc is not None:
+            try:
+                h_alloc, v_alloc = plc.get_macro_routing_allocation()
+            except Exception:
+                h_alloc = getattr(plc, "hrouting_alloc", 0.0)
+                v_alloc = getattr(plc, "vrouting_alloc", 0.0)
+            try:
+                smooth_range = int(plc.get_congestion_smooth_range())
+            except Exception:
+                smooth_range = int(getattr(plc, "smooth_range", 2))
+        
+        wl_norm_n_nets = int(getattr(plc, "net_cnt", n_nets)) if plc is not None else n_nets
+        if wl_norm_n_nets <= 0:
+            wl_norm_n_nets = max(n_nets, 1)
+
+        # Extract weights
+        net_weight = np.ones(n_nets, dtype=np.float64)
+        if plc is not None:
+            try:
+                driver_names = list(plc.nets.keys())
+                for n in range(min(n_nets, len(driver_names))):
+                    pi = plc.mod_name_to_indices[driver_names[n]]
+                    net_weight[n] = float(plc.modules_w_pins[pi].get_weight())
+            except Exception: pass
+
+        # Extract pin tables (pre-flattened for NumPy speed)
+        n_hard = benchmark.num_hard_macros
+        pin_offsets = benchmark.macro_pin_offsets
+        npn = benchmark.net_pin_nodes
+        net_owner, net_offx, net_offy = [], [], []
+        
+        if not npn:
+            for n in range(n_nets):
+                nodes = benchmark.net_nodes[n].cpu().numpy().astype(np.int64) if benchmark.net_nodes else np.zeros(0, dtype=np.int64)
+                net_owner.append(nodes)
+                net_offx.append(np.zeros(nodes.shape[0]))
+                net_offy.append(np.zeros(nodes.shape[0]))
+        else:
+            for n in range(n_nets):
+                pn = npn[n].cpu().numpy().astype(np.int64)
+                if pn.size == 0:
+                    net_owner.append(np.zeros(0, dtype=np.int64))
+                    net_offx.append(np.zeros(0)); net_offy.append(np.zeros(0))
+                    continue
+                owners = pn[:, 0]
+                slots = pn[:, 1]
+                offx, offy = np.zeros(owners.shape[0]), np.zeros(owners.shape[0])
+                for k in range(owners.shape[0]):
+                    o, s = int(owners[k]), int(slots[k])
+                    if o < n_hard and pin_offsets and o < len(pin_offsets):
+                        po = pin_offsets[o]
+                        if po is not None and po.shape[0] > s:
+                            offx[k], offy[k] = float(po[s, 0]), float(po[s, 1])
+                net_owner.append(owners); net_offx.append(offx); net_offy.append(offy)
+
+        return StaticDesignData(
+            h_alloc=h_alloc, v_alloc=v_alloc, smooth_range=smooth_range,
+            wl_norm_n_nets=wl_norm_n_nets, net_weight=net_weight,
+            net_owner=net_owner, net_offx=net_offx, net_offy=net_offy
+        )
+
+
 class FastEvaluator:
     """NumPy reimplementation of PlacementCost.get_cost / get_density_cost /
     get_congestion_cost with incremental update support.
-
-    Validated bit-exact against PlacementCost on ibm01 (and others); a single
-    move_macro() call is ~2 ms (vs ~4000 ms for the oracle).
     """
 
-    def __init__(self, benchmark: Benchmark, plc):
+    def __init__(self, benchmark: Benchmark, data: StaticDesignData):
         self.benchmark = benchmark
+        self.data = data
         self.cw = float(benchmark.canvas_width)
         self.ch = float(benchmark.canvas_height)
         self.grid_col = int(benchmark.grid_cols)
         self.grid_row = int(benchmark.grid_rows)
-        self.gw = self.cw / self.grid_col
-        self.gh = self.ch / self.grid_row
+        self.gw, self.gh = self.cw / self.grid_col, self.ch / self.grid_row
         self.grid_area = self.gw * self.gh
-        self.h_per_um = float(benchmark.hroutes_per_micron)
-        self.v_per_um = float(benchmark.vroutes_per_micron)
-        self.grid_v_routes = self.gw * self.v_per_um
-        self.grid_h_routes = self.gh * self.h_per_um
-        # Routing allocation + smoothing range come from PlacementCost.
-        self.h_alloc = 0.0
-        self.v_alloc = 0.0
-        self.smooth_range = 2
-        if plc is not None:
-            try:
-                self.h_alloc, self.v_alloc = plc.get_macro_routing_allocation()
-            except Exception:
-                self.h_alloc = getattr(plc, "hrouting_alloc", 0.0)
-                self.v_alloc = getattr(plc, "vrouting_alloc", 0.0)
-            try:
-                self.smooth_range = int(plc.get_congestion_smooth_range())
-            except Exception:
-                self.smooth_range = int(getattr(plc, "smooth_range", 2))
-        self.n_hard = benchmark.num_hard_macros
-        self.n_macros = benchmark.num_macros
-        self.n_soft = self.n_macros - self.n_hard
-        self.n_nets = int(benchmark.num_nets)
+        self.h_per_um, self.v_per_um = float(benchmark.hroutes_per_micron), float(benchmark.vroutes_per_micron)
+        self.grid_v_routes, self.grid_h_routes = self.gw * self.v_per_um, self.gh * self.h_per_um
+        
+        self.h_alloc, self.v_alloc = data.h_alloc, data.v_alloc
+        self.smooth_range = data.smooth_range
+        self.n_hard, self.n_macros = benchmark.num_hard_macros, benchmark.num_macros
+        self.n_soft, self.n_nets = self.n_macros - self.n_hard, int(benchmark.num_nets)
         self.n_ports = int(benchmark.port_positions.shape[0])
-        # WL normalization uses plc.net_cnt (counts every driver pin, not just nets with sinks)
-        self.wl_norm_n_nets = int(getattr(plc, "net_cnt", self.n_nets)) if plc is not None else self.n_nets
-        if self.wl_norm_n_nets <= 0:
-            self.wl_norm_n_nets = max(self.n_nets, 1)
-        # State arrays
+        self.wl_norm_n_nets = data.wl_norm_n_nets
+
         self.positions = benchmark.macro_positions.detach().cpu().numpy().astype(np.float64)
         self.sizes = benchmark.macro_sizes.detach().cpu().numpy().astype(np.float64)
         self.half = self.sizes / 2.0
         self.port_pos = benchmark.port_positions.detach().cpu().numpy().astype(np.float64) if self.n_ports else np.zeros((0, 2))
         self.movable = benchmark.get_movable_mask().detach().cpu().numpy().astype(bool)
-        # Per-net tables
-        self._build_net_pin_tables(benchmark)
+        
+        self.net_owner, self.net_offx, self.net_offy = data.net_owner, data.net_offx, data.net_offy
         self._net_xmin = np.zeros(self.n_nets, dtype=np.float64)
         self._net_ymin = np.zeros(self.n_nets, dtype=np.float64)
         self._net_xmax = np.zeros(self.n_nets, dtype=np.float64)
         self._net_ymax = np.zeros(self.n_nets, dtype=np.float64)
-        self._net_weight = np.ones(self.n_nets, dtype=np.float64)
-        if plc is not None:
-            self._fetch_net_weights(plc)
+        self._net_weight = data.net_weight
+        
         self._owner_to_nets: Dict[int, List[int]] = {}
         for n in range(self.n_nets):
             for o in self.net_owner[n]:
                 self._owner_to_nets.setdefault(int(o), []).append(n)
-        # Grids
+        
         self.density_grid = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
         self.h_pin_cong = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
         self.v_pin_cong = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
         self.h_macro_cong = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
         self.v_macro_cong = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
         self._init_caches()
-
-    def _build_net_pin_tables(self, benchmark: Benchmark):
-        pin_offsets = benchmark.macro_pin_offsets
-        npn = benchmark.net_pin_nodes
-        self.net_owner: List[np.ndarray] = []
-        self.net_offx: List[np.ndarray] = []
-        self.net_offy: List[np.ndarray] = []
-        if not npn:
-            for n in range(self.n_nets):
-                nodes = benchmark.net_nodes[n].cpu().numpy().astype(np.int64) if benchmark.net_nodes else np.zeros(0, dtype=np.int64)
-                self.net_owner.append(nodes)
-                self.net_offx.append(np.zeros(nodes.shape[0]))
-                self.net_offy.append(np.zeros(nodes.shape[0]))
-            return
-        for n in range(self.n_nets):
-            pn = npn[n].cpu().numpy().astype(np.int64)
-            if pn.size == 0:
-                self.net_owner.append(np.zeros(0, dtype=np.int64))
-                self.net_offx.append(np.zeros(0))
-                self.net_offy.append(np.zeros(0))
-                continue
-            owners = pn[:, 0]
-            slots = pn[:, 1]
-            offx = np.zeros(owners.shape[0])
-            offy = np.zeros(owners.shape[0])
-            for k in range(owners.shape[0]):
-                o, s = int(owners[k]), int(slots[k])
-                if o < self.n_hard and pin_offsets and o < len(pin_offsets):
-                    po = pin_offsets[o]
-                    if po is not None and po.shape[0] > s:
-                        offx[k] = float(po[s, 0])
-                        offy[k] = float(po[s, 1])
-            self.net_owner.append(owners)
-            self.net_offx.append(offx)
-            self.net_offy.append(offy)
-
-    def _fetch_net_weights(self, plc):
-        try:
-            driver_names = list(plc.nets.keys())
-            for n in range(min(self.n_nets, len(driver_names))):
-                pi = plc.mod_name_to_indices[driver_names[n]]
-                self._net_weight[n] = float(plc.modules_w_pins[pi].get_weight())
-        except Exception:
-            pass
 
     def _pin_x(self, owners, offx):
         out = np.empty(owners.shape[0], dtype=np.float64)
@@ -1198,27 +1212,15 @@ import concurrent.futures
 import multiprocessing
 
 def _run_single_lahc_worker(
-    bench_name: str,
+    benchmark: Benchmark,
+    data: StaticDesignData,
     init_pos: np.ndarray,
     list_len: int,
     time_budget_s: float,
     seed: int,
-    verbose: bool,
 ):
-    """Worker function for Parallel LAHC.  Reloads EVERYTHING locally."""
-    # We must reload to get a fresh PlacementCost object per process
-    from macro_place.loader import load_benchmark, load_benchmark_from_dir
-    root = Path("external/MacroPlacement/Testcases/ICCAD04") / bench_name
-    if root.exists():
-        benchmark, plc = load_benchmark_from_dir(str(root))
-    else:
-        # Best-effort for NG45
-        ng45 = {"ariane133": "ariane133", "ariane136": "ariane136", "nvdla": "nvdla", "mempool_tile": "mempool_tile"}
-        d = ng45.get(bench_name.replace("_ng45", ""))
-        base = Path("external/MacroPlacement/Flows/NanGate45") / d / "netlist" / "output_CT_Grouping"
-        benchmark, plc = load_benchmark(str(base / "netlist.pb.txt"), str(base / "initial.plc"))
-
-    ev = FastEvaluator(benchmark, plc)
+    """Worker function for Parallel LAHC. Runs in a fresh process."""
+    ev = FastEvaluator(benchmark, data)
     ev.restore(init_pos)
     
     out = lahc_polish(
@@ -1226,13 +1228,14 @@ def _run_single_lahc_worker(
         list_len=list_len,
         time_budget_s=time_budget_s,
         seed=seed,
-        verbose=False, # Shush workers
+        verbose=False,
     )
     return {"proxy_cost": out["proxy_cost"], "positions": ev.positions.copy(), "iters": out["iters"]}
 
 
 def parallel_lahc_polish(
-    bench_name: str,
+    benchmark: Benchmark,
+    data: StaticDesignData,
     init_pos: np.ndarray,
     list_len: int = 100,
     time_budget_s: float = 600.0,
@@ -1240,23 +1243,21 @@ def parallel_lahc_polish(
     base_seed: int = 0,
     verbose: bool = True,
 ):
-    """Launch N independent LAHC chains in parallel processes."""
+    """Launch N independent LAHC chains in parallel processes using pickleable design data."""
     if verbose:
         print(f"  [PAR-LAHC] launching {n_chains} chains in parallel for {time_budget_s:.0f}s", flush=True)
     
-    # Use 'spawn' or 'forkserver' if available for cleaner memory on some platforms
-    # but 'fork' is usually fastest on Linux if the parent isn't too bloated.
     with concurrent.futures.ProcessPoolExecutor(max_workers=n_chains) as executor:
         futures = []
         for i in range(n_chains):
             f = executor.submit(
                 _run_single_lahc_worker,
-                bench_name,
+                benchmark,
+                data,
                 init_pos,
                 list_len,
                 time_budget_s,
-                base_seed + i * 100,
-                verbose
+                base_seed + i * 100
             )
             futures.append(f)
         
@@ -1264,11 +1265,15 @@ def parallel_lahc_polish(
         best_pos = None
         total_iters = 0
         for f in concurrent.futures.as_completed(futures):
-            res = f.result()
-            total_iters += res["iters"]
-            if res["proxy_cost"] < best_cost:
-                best_cost = res["proxy_cost"]
-                best_pos = res["positions"]
+            try:
+                res = f.result()
+                total_iters += res["iters"]
+                if res["proxy_cost"] < best_cost:
+                    best_cost = res["proxy_cost"]
+                    best_pos = res["positions"]
+            except Exception as e:
+                if verbose:
+                    print(f"    [PAR-LAHC] Worker failed: {e}", flush=True)
     
     if verbose:
         print(f"  [PAR-LAHC] all done. total iters={total_iters}  best={best_cost:.4f}", flush=True)
@@ -1326,6 +1331,13 @@ class LKPlacer:
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         from macro_place.objective import compute_proxy_cost
 
+        # Ensure child processes can import this file as a module named 'placer'
+        # when it is loaded dynamically by the evaluation script.
+        import sys
+        me = Path(__file__).resolve().parent
+        if str(me) not in sys.path:
+            sys.path.append(str(me))
+
         t0 = time.time()
         random.seed(self.seed)
         np.random.seed(self.seed)
@@ -1335,12 +1347,8 @@ class LKPlacer:
         # ── Phase α — Focused Electrostatic GP ──
         if self.run_gp:
             try:
-                # Import inside to avoid hard dependency at module import time
                 import importlib.util
-                spec = importlib.util.spec_from_file_location(
-                    "lk_placer_gp",
-                    str(Path(__file__).resolve().parent / "gp.py"),
-                )
+                spec = importlib.util.spec_from_file_location("lk_placer_gp", str(me / "gp.py"))
                 gp_mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(gp_mod)
                 self._log(f"Phase α: focused electrostatic global placement (pop={self.gp_pop_size}, steps={self.gp_steps}, budget={self.gp_budget_s:.0f}s)")
@@ -1356,6 +1364,10 @@ class LKPlacer:
             except Exception as e:
                 self._log(f"Phase α: SKIPPED due to exception: {e}")
 
+        # ── BOOTSTRAP: Extract data and discard C++ pointer ──
+        self._log("Bootstrap: extracting design data and discarding C++ oracle")
+        data = StaticDesignData.extract(benchmark, plc)
+        
         n_hard = benchmark.num_hard_macros
         cw = float(benchmark.canvas_width)
         ch = float(benchmark.canvas_height)
@@ -1372,9 +1384,10 @@ class LKPlacer:
 
         # ── Phase 1 — FastEvaluator ──
         self._log("Phase 1: building FastEvaluator")
-        ev = FastEvaluator(benchmark, plc)
+        ev = FastEvaluator(benchmark, data)
         c0 = ev.proxy_cost()
         self._log(f"  fast baseline: proxy={c0['proxy_cost']:.4f} wl={c0['wirelength_cost']:.4f} den={c0['density_cost']:.4f} cong={c0['congestion_cost']:.4f}")
+        
         true_c = compute_proxy_cost(torch.from_numpy(ev.positions).float(), benchmark, plc)
         self._log(f"  oracle: {true_c['proxy_cost']:.4f}  overlaps={true_c['overlap_count']}")
         best_true = float(true_c["proxy_cost"]) if true_c["overlap_count"] == 0 else float("inf")
@@ -1446,7 +1459,8 @@ class LKPlacer:
         remaining = max(60.0, self.time_budget_s - (time.time() - t0))
         self._log(f"Phase 3: Parallel LAHC polish, budget={remaining:.0f}s")
         out = parallel_lahc_polish(
-            benchmark.name,
+            benchmark,
+            data,
             ev.positions,
             list_len=self.lahc_list_len,
             time_budget_s=remaining,
@@ -1456,9 +1470,10 @@ class LKPlacer:
         )
         self._log(f"  LAHC: best={out['proxy_cost']:.4f}  total_iters={out['iters']}")
         ev.restore(out["positions"])
-        tc = compute_proxy_cost(torch.from_numpy(ev.positions).float(), benchmark, plc)
-        if tc["overlap_count"] == 0 and tc["proxy_cost"] < best_true:
-            best_true = float(tc["proxy_cost"])
+        
+        final_tc = compute_proxy_cost(torch.from_numpy(ev.positions).float(), benchmark, plc)
+        if final_tc["overlap_count"] == 0 and final_tc["proxy_cost"] < best_true:
+            best_true = float(final_tc["proxy_cost"])
             best_pos = ev.positions.copy()
 
         self._log(f"DONE  best_true={best_true:.4f}  time={time.time()-t0:.1f}s")
