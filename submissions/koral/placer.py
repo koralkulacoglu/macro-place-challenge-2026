@@ -1194,6 +1194,87 @@ def _load_plc(name: str):
     return None
 
 
+import concurrent.futures
+import multiprocessing
+
+def _run_single_lahc_worker(
+    bench_name: str,
+    init_pos: np.ndarray,
+    list_len: int,
+    time_budget_s: float,
+    seed: int,
+    verbose: bool,
+):
+    """Worker function for Parallel LAHC.  Reloads EVERYTHING locally."""
+    # We must reload to get a fresh PlacementCost object per process
+    from macro_place.loader import load_benchmark, load_benchmark_from_dir
+    root = Path("external/MacroPlacement/Testcases/ICCAD04") / bench_name
+    if root.exists():
+        benchmark, plc = load_benchmark_from_dir(str(root))
+    else:
+        # Best-effort for NG45
+        ng45 = {"ariane133": "ariane133", "ariane136": "ariane136", "nvdla": "nvdla", "mempool_tile": "mempool_tile"}
+        d = ng45.get(bench_name.replace("_ng45", ""))
+        base = Path("external/MacroPlacement/Flows/NanGate45") / d / "netlist" / "output_CT_Grouping"
+        benchmark, plc = load_benchmark(str(base / "netlist.pb.txt"), str(base / "initial.plc"))
+
+    ev = FastEvaluator(benchmark, plc)
+    ev.restore(init_pos)
+    
+    out = lahc_polish(
+        ev,
+        list_len=list_len,
+        time_budget_s=time_budget_s,
+        seed=seed,
+        verbose=False, # Shush workers
+    )
+    return {"proxy_cost": out["proxy_cost"], "positions": ev.positions.copy(), "iters": out["iters"]}
+
+
+def parallel_lahc_polish(
+    bench_name: str,
+    init_pos: np.ndarray,
+    list_len: int = 100,
+    time_budget_s: float = 600.0,
+    n_chains: int = 16,
+    base_seed: int = 0,
+    verbose: bool = True,
+):
+    """Launch N independent LAHC chains in parallel processes."""
+    if verbose:
+        print(f"  [PAR-LAHC] launching {n_chains} chains in parallel for {time_budget_s:.0f}s", flush=True)
+    
+    # Use 'spawn' or 'forkserver' if available for cleaner memory on some platforms
+    # but 'fork' is usually fastest on Linux if the parent isn't too bloated.
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_chains) as executor:
+        futures = []
+        for i in range(n_chains):
+            f = executor.submit(
+                _run_single_lahc_worker,
+                bench_name,
+                init_pos,
+                list_len,
+                time_budget_s,
+                base_seed + i * 100,
+                verbose
+            )
+            futures.append(f)
+        
+        best_cost = float("inf")
+        best_pos = None
+        total_iters = 0
+        for f in concurrent.futures.as_completed(futures):
+            res = f.result()
+            total_iters += res["iters"]
+            if res["proxy_cost"] < best_cost:
+                best_cost = res["proxy_cost"]
+                best_pos = res["positions"]
+    
+    if verbose:
+        print(f"  [PAR-LAHC] all done. total iters={total_iters}  best={best_cost:.4f}", flush=True)
+    return {"proxy_cost": best_cost, "positions": best_pos, "iters": total_iters}
+
+
 class LKPlacer:
     """Five-phase macro placer.  See module docstring."""
 
@@ -1363,15 +1444,18 @@ class LKPlacer:
         if best_pos is not None:
             ev.restore(best_pos)
         remaining = max(60.0, self.time_budget_s - (time.time() - t0))
-        self._log(f"Phase 3: LAHC polish, budget={remaining:.0f}s")
-        out = lahc_polish(
-            ev,
+        self._log(f"Phase 3: Parallel LAHC polish, budget={remaining:.0f}s")
+        out = parallel_lahc_polish(
+            benchmark.name,
+            ev.positions,
             list_len=self.lahc_list_len,
             time_budget_s=remaining,
-            seed=self.seed,
+            n_chains=16,
+            base_seed=self.seed,
             verbose=self.verbose,
         )
-        self._log(f"  LAHC: best={out['proxy_cost']:.4f}  iters={out['iters']}")
+        self._log(f"  LAHC: best={out['proxy_cost']:.4f}  total_iters={out['iters']}")
+        ev.restore(out["positions"])
         tc = compute_proxy_cost(torch.from_numpy(ev.positions).float(), benchmark, plc)
         if tc["overlap_count"] == 0 and tc["proxy_cost"] < best_true:
             best_true = float(tc["proxy_cost"])
