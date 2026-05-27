@@ -128,7 +128,8 @@ def _load_placer(path: Path):
 # ── Single-benchmark evaluation ─────────────────────────────────────────────
 
 
-def evaluate_benchmark(placer, name: str, testcase_root: str, ng45_dir: str = None) -> dict:
+def evaluate_benchmark(placer, name: str, testcase_root: str, ng45_dir: str = None,
+                       live: bool = False) -> dict:
     """Run *placer* on a single benchmark and return a results dict."""
     if ng45_dir:
         netlist_file = f"{ng45_dir}/netlist.pb.txt"
@@ -138,12 +139,22 @@ def evaluate_benchmark(placer, name: str, testcase_root: str, ng45_dir: str = No
         benchmark_dir = f"{testcase_root}/{name}"
         benchmark, plc = load_benchmark_from_dir(benchmark_dir)
 
+    viz = None
+    if live:
+        from macro_place.live_vis import LiveVisualizer
+
+        viz = LiveVisualizer(benchmark)
+        placer._live_callback = viz.update
+
     start = time.time()
     placement = placer.place(benchmark)
     runtime = time.time() - start
 
     is_valid, violations = validate_placement(placement, benchmark)
     costs = compute_proxy_cost(placement, benchmark, plc)
+
+    if viz is not None:
+        viz.finish(placement, costs)
 
     return {
         "name": name,
@@ -277,6 +288,12 @@ def main():
         action="store_true",
         help="Visualize each placement after evaluation (saves to vis/<benchmark>.png).",
     )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Show a live animated visualization while the placer runs "
+        "(native only — needs a GUI backend, will not display inside Docker).",
+    )
     args = parser.parse_args()
 
     # ── resolve paths ────────────────────────────────────────────────────
@@ -299,6 +316,11 @@ def main():
     else:
         benchmarks_to_run = [args.benchmark or "ibm01"]
 
+    if args.live and len(benchmarks_to_run) > 1:
+        print("Note: --live runs one benchmark at a time; using only the first "
+              f"({benchmarks_to_run[0]}).")
+        benchmarks_to_run = benchmarks_to_run[:1]
+
     # ── run ──────────────────────────────────────────────────────────────
     print("=" * 80)
     print(f"evaluate · {placer_name}  ({placer_path})")
@@ -309,7 +331,8 @@ def main():
     for name in benchmarks_to_run:
         print(f"  {name}...", end=" ", flush=True)
         ng45_dir = NG45_BENCHMARKS.get(name) if args.ng45 or name in NG45_BENCHMARKS else None
-        result = evaluate_benchmark(placer, name, str(testcase_root), ng45_dir=ng45_dir)
+        result = evaluate_benchmark(placer, name, str(testcase_root), ng45_dir=ng45_dir,
+                                    live=args.live)
         results.append(result)
 
         status = (

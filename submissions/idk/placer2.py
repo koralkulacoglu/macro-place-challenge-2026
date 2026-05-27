@@ -567,6 +567,7 @@ def true_cost_subgradient(
     momentum: float = 0.9,
     seed: int = 0,
     verbose: bool = True,
+    progress_callback=None,
 ):
     """Adam-style stochastic gradient descent on the EXACT proxy cost.
 
@@ -596,9 +597,13 @@ def true_cost_subgradient(
     mom = np.zeros_like(ev.positions)
     t0 = time.time()
     last_log = t0
+    last_cb = 0.0
     accepted = 0
     n_iters = 0
     while time.time() - t0 < time_budget_s:
+        if progress_callback is not None and time.time() - last_cb > _CB_INTERVAL:
+            _emit_progress(progress_callback, ev, "subgrad", n_iters, best_cost, t0)
+            last_cb = time.time()
         i = int(rng.integers(0, ev.n_macros))
         if not ev.movable[i]:
             n_iters += 1
@@ -746,10 +751,16 @@ def lk_swap_pass(
     chain_depth: int = 4,
     n_neighbors_per_macro: int = 24,
     log_every: Optional[int] = None,
+    progress_callback=None,
 ):
     cur_cost = ev.proxy_cost()["proxy_cost"]
     accepted = 0
+    t0 = time.time()
+    last_cb = 0.0
     for step, i in enumerate(macros):
+        if progress_callback is not None and time.time() - last_cb > _CB_INTERVAL:
+            _emit_progress(progress_callback, ev, "LK", step, cur_cost, t0)
+            last_cb = time.time()
         if not ev.movable[i]:
             continue
         d = np.linalg.norm(ev.positions[:ev.n_hard] - ev.positions[i], axis=1)
@@ -839,6 +850,40 @@ def _smoothed_congestion_grid(ev: FastEvaluator) -> np.ndarray:
     v_s = ev._smooth(v, axis=0)
     h_s = ev._smooth(h, axis=1)
     return (v_s + vm) + (h_s + hm)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Live-visualization hook (no-op unless a callback is supplied)
+# ────────────────────────────────────────────────────────────────────────────
+
+_CB_INTERVAL = 0.1  # min seconds between live-visualization frames
+
+
+def _emit_progress(cb, ev, phase, it, best, t0):
+    """Fire one live-visualization frame from a FastEvaluator's current state.
+
+    Cheap enough to call at ~10 Hz (one proxy_cost + one smoothed-grid pass);
+    never raises into the optimizer.
+    """
+    if cb is None:
+        return
+    try:
+        c = ev.proxy_cost()
+        cb({
+            "positions": ev.positions.copy(),
+            "phase": phase,
+            "iteration": int(it),
+            "proxy": c["proxy_cost"],
+            "wl": c["wirelength_cost"],
+            "density": c["density_cost"],
+            "congestion": c["congestion_cost"],
+            "best": float(best),
+            "elapsed": time.time() - t0,
+            "density_grid": ev.density_grid / ev.grid_area,
+            "congestion_grid": _smoothed_congestion_grid(ev),
+        })
+    except Exception:
+        pass
 
 
 def direct_congestion_attack(
@@ -987,6 +1032,7 @@ def lahc_polish(
     decongest_refresh_every: int = 100,  # recompute hot-cell list every N iters
     seed: int = 0,
     verbose: bool = True,
+    progress_callback=None,
 ):
     rng = np.random.default_rng(seed)
     cur_cost = ev.proxy_cost()["proxy_cost"]
@@ -995,6 +1041,7 @@ def lahc_polish(
     history = [cur_cost] * list_len
     t0 = time.time()
     last_log = t0
+    last_cb = 0.0
     it = 0
     # Hot-cell cache for decongest proposals
     hot_cells: List[Tuple[int, int, float]] = []   # (row, col, heat)
@@ -1004,6 +1051,9 @@ def lahc_polish(
         if verbose and time.time() - last_log > 20.0:
             print(f"  [LAHC] t={time.time()-t0:.0f}s it={it} cur={cur_cost:.4f} best={best_cost:.4f}", flush=True)
             last_log = time.time()
+        if progress_callback is not None and time.time() - last_cb > _CB_INTERVAL:
+            _emit_progress(progress_callback, ev, "LAHC", it, best_cost, t0)
+            last_cb = time.time()
         # Periodically refresh the hot-cell list and the macros contributing to them
         if it - last_hot_refresh >= decongest_refresh_every:
             cong = _smoothed_congestion_grid(ev)
@@ -1334,6 +1384,7 @@ def regional_polish(
     min_macros_per_region: int = 3,
     seed: int = 0,
     verbose: bool = True,
+    progress_callback=None,
 ):
     """Hierarchical region-based polish.
 
@@ -1353,6 +1404,7 @@ def regional_polish(
     best_cost = cur_cost
     best_pos = ev.positions.copy()
     t0 = time.time()
+    last_cb = 0.0
     total_iters = 0
     total_accepted = 0
     for sweep_idx, R in enumerate(region_grids):
@@ -1399,6 +1451,9 @@ def regional_polish(
                 best_pos = ev.positions.copy()
             cur_cost = new_c
             regions_done += 1
+            if progress_callback is not None and time.time() - last_cb > _CB_INTERVAL:
+                _emit_progress(progress_callback, ev, "regional", total_iters, best_cost, t0)
+                last_cb = time.time()
         if verbose:
             print(
                 f"  [REGIONAL] sweep {sweep_idx+1}/{len(region_grids)} R={R}  "

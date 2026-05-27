@@ -47,7 +47,11 @@ def _load_plc(name: str):
 
     root = Path("external/MacroPlacement/Testcases/ICCAD04") / name
     if root.exists():
-        _, plc = load_benchmark_from_dir(str(root))
+        # Use as_posix() so plc_client_os's rsplit('/') works on Windows too.
+        _, plc = load_benchmark(
+            (root / "netlist.pb.txt").as_posix(),
+            (root / "initial.plc").as_posix(),
+        )
         return plc
     ng45 = {
         "ariane133_ng45": "ariane133",
@@ -69,7 +73,8 @@ def _load_plc(name: str):
         )
         if (base / "netlist.pb.txt").exists():
             _, plc = load_benchmark(
-                str(base / "netlist.pb.txt"), str(base / "initial.plc")
+                (base / "netlist.pb.txt").as_posix(),
+                (base / "initial.plc").as_posix(),
             )
             return plc
     return None
@@ -562,6 +567,8 @@ class GraphGradPlacer:
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)
 
+        cb = getattr(self, "_live_callback", None)
+
         n_hard = benchmark.num_hard_macros
         n_macros = benchmark.num_macros
         cw = float(benchmark.canvas_width)
@@ -614,12 +621,26 @@ class GraphGradPlacer:
             nonlocal best_pos, best_true
             c, ov = _oracle(pos_np)
             self._log(f"  [{label}] oracle proxy={c:.4f} overlaps={ov}")
+            improved = False
             if ov == 0 and c < best_true:
                 best_true = c
                 best_pos = pos_np.copy()
                 self._log(f"  [{label}] new best={best_true:.4f}")
-                return True
-            return False
+                improved = True
+            if cb is not None and ov == 0:
+                try:
+                    cb({
+                        "positions": pos_np.copy(),
+                        "phase": label,
+                        "proxy": c,
+                        "best": best_true if best_true != float("inf") else c,
+                        "elapsed": time.time() - t0,
+                        "density_grid": None,
+                        "congestion_grid": None,
+                    })
+                except Exception:
+                    pass
+            return improved
 
         # ── Phase α₁: focused-Poisson electrostatic GP ──
         # Start GP from anchor (the legalized initial.plc).
@@ -639,6 +660,7 @@ class GraphGradPlacer:
                     time_budget_s=max(10.0, budget),
                     seed=self.seed,
                     verbose=self.verbose,
+                    progress_callback=cb,
                 )
                 # Legalize hard macros after GP (it can move them slightly into overlap)
                 gp_hard = gp_positions[:n_hard].astype(np.float64)
@@ -661,7 +683,7 @@ class GraphGradPlacer:
             try:
                 pos_full, surr_cost = self._run_soft_adam(
                     benchmark, K=soft_K, n_steps=soft_steps,
-                    budget_s=budget, plc=plc,
+                    budget_s=budget, plc=plc, progress_callback=cb, t0=t0,
                 )
                 if pos_full is not None:
                     _commit(pos_full, "α₂ soft-Adam")
@@ -695,6 +717,12 @@ class GraphGradPlacer:
             f"wl={c_fast['wirelength_cost']:.4f} d={c_fast['density_cost']:.4f} "
             f"c={c_fast['congestion_cost']:.4f}"
         )
+        if cb is not None:
+            # Light up the heatmaps as soon as the FastEvaluator is online.
+            try:
+                lk_mod._emit_progress(cb, ev, "FastEval", 0, best_true, t0)
+            except Exception:
+                pass
         # Drift check: fast vs oracle should agree to ~1e-3.
         drift = abs(c_fast["proxy_cost"] - best_true)
         if drift > 5e-3:
@@ -705,7 +733,8 @@ class GraphGradPlacer:
             budget = min(self.subgrad_budget_s, self.time_budget_s - (time.time() - t0) - self.lahc_min_budget_s)
             self._log(f"Phase 2: true-cost subgradient (budget={budget:.0f}s)")
             try:
-                lk_mod.true_cost_subgradient(ev, time_budget_s=budget, seed=self.seed, verbose=self.verbose)
+                lk_mod.true_cost_subgradient(ev, time_budget_s=budget, seed=self.seed,
+                                             verbose=self.verbose, progress_callback=cb)
                 _commit(ev.positions.copy(), "subgrad")
             except Exception as e:
                 self._log(f"Phase 2: exception: {e}")
@@ -728,6 +757,7 @@ class GraphGradPlacer:
                         chain_depth=self.lk_chain_depth,
                         n_neighbors_per_macro=self.lk_neighbors,
                         log_every=max(1, len(order) // 6) if self.verbose else None,
+                        progress_callback=cb,
                     )
                     self._log(f"  pass {p}: fast={cur_cost:.4f} accepted={n_acc}")
                     _commit(ev.positions.copy(), f"LK p{p}")
@@ -755,6 +785,7 @@ class GraphGradPlacer:
                     time_budget_s=budget,
                     seed=self.seed,
                     verbose=self.verbose,
+                    progress_callback=cb,
                 )
                 _commit(ev.positions.copy(), "regional")
             except Exception as e:
@@ -773,6 +804,7 @@ class GraphGradPlacer:
                     time_budget_s=remaining,
                     seed=self.seed,
                     verbose=self.verbose,
+                    progress_callback=cb,
                 )
                 _commit(ev.positions.copy(), "LAHC")
             except Exception as e:
@@ -798,6 +830,8 @@ class GraphGradPlacer:
         n_steps: int,
         budget_s: float,
         plc,
+        progress_callback=None,
+        t0=None,
     ) -> Tuple[Optional[np.ndarray], float]:
         """Run K-batched Adam on the TILOS-faithful surrogate with hard macros
         locked at their current positions in `benchmark.macro_positions`.
@@ -832,6 +866,7 @@ class GraphGradPlacer:
         opt = torch.optim.Adam([pop], lr=self.soft_lr)
 
         log_every = max(n_steps // 6, 1)
+        last_cb = 0.0
         for step in range(n_steps):
             if time.time() - t_start > budget_s:
                 if self.verbose:
@@ -866,6 +901,24 @@ class GraphGradPlacer:
                     f"d={dens.mean().item():.4f} c={cong.mean().item():.4f} "
                     f"surr={proxy_surr.mean().item():.4f}"
                 )
+            if progress_callback is not None and time.time() - last_cb > 0.1:
+                try:
+                    k0 = int(torch.argmin(proxy_surr).item())
+                    progress_callback({
+                        "positions": pop[k0].detach().cpu().numpy().astype(np.float64),
+                        "phase": "soft-Adam",
+                        "iteration": step,
+                        "proxy": float(proxy_surr[k0].item()),
+                        "wl": float(wl_n[k0].item()),
+                        "density": float(dens[k0].item()),
+                        "congestion": float(cong[k0].item()),
+                        "elapsed": time.time() - (t0 if t0 else t_start),
+                        "density_grid": None,
+                        "congestion_grid": None,
+                    })
+                except Exception:
+                    pass
+                last_cb = time.time()
 
         # Rank candidates by surrogate; oracle-evaluate top-8.
         with torch.no_grad():

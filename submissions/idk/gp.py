@@ -515,6 +515,7 @@ def run_global_placement(
     replica_temperatures: Optional[Tuple[float, ...]] = None,
     verbose: bool = True,
     log_every: int = 50,
+    progress_callback=None,
 ) -> np.ndarray:
     """Run electrostatic global placement, return best-cost positions [N, 2].
 
@@ -590,6 +591,7 @@ def run_global_placement(
     reweight_every = 60   # steps
     reweight_alpha = 3.0  # multiplier for hot-net WL weight
     t0 = time.time()
+    last_cb = 0.0
     losses_history = []
     for step in range(n_steps):
         if time.time() - t0 > time_budget_s:
@@ -669,6 +671,19 @@ def run_global_placement(
                 flush=True,
             )
         losses_history.append(loss.item())
+        if progress_callback is not None and time.time() - last_cb > 0.1:
+            try:
+                progress_callback({
+                    "positions": pop[0].detach().cpu().numpy().astype(np.float64),
+                    "phase": "GP",
+                    "iteration": step,
+                    "elapsed": time.time() - t0,
+                    "density_grid": None,
+                    "congestion_grid": None,
+                })
+            except Exception:
+                pass
+            last_cb = time.time()
 
     # Pick best replica by true proxy cost
     if verbose:
